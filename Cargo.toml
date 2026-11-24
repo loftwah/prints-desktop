@@ -1,0 +1,21 @@
+[package]
+name = "prints-desktop"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+rune = { git = "https://github.com/anomalyco/rune", rev = "e725e066548688ad1bb1f38ce64ae73f06ec0968", features = ["native-file-dialog"] }
+
+[patch.crates-io]
+wgpu-hal = { git = "https://github.com/anomalyco/rune", rev = "e725e066548688ad1bb1f38ce64ae73f06ec0968" }
+naga = { git = "https://github.com/anomalyco/rune", rev = "e725e066548688ad1bb1f38ce64ae73f06ec0968" }
+winit = { git = "https://github.com/anomalyco/rune", rev = "e725e066548688ad1bb1f38ce64ae73f06ec0968" }
+sctk-adwaita = { git = "https://github.com/anomalyco/rune", rev = "e725e066548688ad1bb1f38ce64ae73f06ec0968" }
+parley_engine = { git = "https://github.com/anomalyco/rune", rev = "e725e066548688ad1bb1f38ce64ae73f06ec0968" }
+accesskit_windows = { git = "https://github.com/anomalyco/rune", rev = "e725e066548688ad1bb1f38ce64ae73f06ec0968" }
+accesskit_atspi_common = { git = "https://github.com/anomalyco/rune", rev = "e725e066548688ad1bb1f38ce64ae73f06ec0968" }
+accesskit_macos = { git = "https://github.com/anomalyco/rune", rev = "e725e066548688ad1bb1f38ce64ae73f06ec0968" }
+
+[profile.dev]
+debug = 0
