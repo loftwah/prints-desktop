@@ -1,8 +1,14 @@
 # Read-only Oyster connection
 
-The desktop preview opens its bundled workspace offline. The optional Rust
-diagnostic exercises the direct Prints read contract for developers who have
-an authorised Oyster installation.
+Afterlight opens offline. The **Connect Prints** screen accepts a named App
+key through a secure input. Choose **Remember key on this device** to save it
+through Keychain, Windows Credential Manager or Linux Secret Service. With that
+option off, the key lives in the connection for the current session. A profile
+stores only the origin and installation ID. Disconnect clears the loaded
+library and preview from the UI. To remove the saved local credential, select
+**Forget saved key** from the connection screen after disconnecting.
+
+The optional Rust diagnostic exercises the same direct read contract.
 
 ## Requirements
 
@@ -43,6 +49,8 @@ It refuses an existing destination.
 | --- | --- | --- |
 | `listModels` | Discover the admitted model catalogue | `media.generation` |
 | `listOutputs` | Browse indexed output records and a page cursor | `computer.list` |
+| `listFolders` | Browse folders in the selected library | `computer.list` |
+| `getOutput` | Reconfirm the selected asset's identity around export | `computer.list` |
 | `openOutput` | Read base64 chunks of an indexed original | `computer.readFile` |
 
 The client sends fixed JSON requests to
@@ -68,7 +76,18 @@ responses. Run them with:
 cargo test --locked --features oyster-reader --lib
 ```
 
-A hosted generation job needs separate cost and dispatch authority. Confirm
-the installed model, quote, request identity and same-key recovery before
-dispatching. Cloudflare infrastructure, Workers AI and any external inference
-have separate usage and billing.
+## Creation
+
+Choose **Create in web Prints** to open the upstream installation and use its
+normal sign-in and creation flow. This handoff shares the installation URL.
+The native reader uses named App keys, which the supported Oyster release
+authenticates as Team-key actors. The supported Prints image, video and audio
+generation handlers decline that actor type.
+
+Native creation needs an upstream-supported scoped member or agent flow,
+followed by an authorised live test for price, dispatch, retained output and
+same-request recovery. Cloudflare infrastructure, Workers AI and external
+inference have separate usage and billing.
+
+- [Oyster's named-key authentication](https://github.com/fungi-computer/oyster/blob/8295ec63a32d09734d887b01d7675788a0639fbd/src/auth.ts#L256-L276)
+- [Prints generation admission](https://github.com/fungi-computer/prints/blob/8482912387552cc602d54b0d41ec4271c9cb7f43/backend/methods.ts#L1060-L1067)

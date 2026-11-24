@@ -1,10 +1,11 @@
 [package]
 name = "prints-desktop"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 
 [features]
+default = ["oyster-reader"]
 oyster-reader = ["dep:base64", "dep:reqwest", "dep:rpassword", "dep:serde", "dep:serde_json", "dep:url"]
 
 [[example]]
@@ -19,6 +20,15 @@ serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 url = { version = "2", optional = true }
 rune = { git = "https://github.com/anomalyco/rune", rev = "e725e066548688ad1bb1f38ce64ae73f06ec0968", features = ["native-file-dialog"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3.6.3", default-features = false, features = ["apple-native"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3.6.3", default-features = false, features = ["windows-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3.6.3", default-features = false, features = ["sync-secret-service", "crypto-rust"] }
 
 [patch.crates-io]
 wgpu-hal = { git = "https://github.com/anomalyco/rune", rev = "e725e066548688ad1bb1f38ce64ae73f06ec0968" }
