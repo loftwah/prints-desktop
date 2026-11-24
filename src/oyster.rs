@@ -14,6 +14,9 @@ use std::io::Read;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::{Duration, Instant};
 
+mod library;
+pub use library::{Folder, FolderPage};
+
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use reqwest::blocking::{Client, Response};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderValue};
@@ -154,6 +157,21 @@ impl OysterClient {
         })
     }
 
+    /// Canonical origin and the validated installation identifier.
+    pub fn identity(&self) -> (String, String) {
+        (
+            self.base.origin().ascii_serialization(),
+            self.installation.clone(),
+        )
+    }
+
+    /// Browser entry point, without a key or private asset path.
+    pub fn app_url(&self) -> String {
+        let mut url = self.base.clone();
+        url.set_path(&format!("/apps/{}/", self.installation));
+        url.into()
+    }
+
     /// `test-connection`: `listModels` is a read that spends nothing.
     pub fn test_connection(&self) -> Result<ModelList, Error> {
         self.list_models()
@@ -234,12 +252,20 @@ impl OysterClient {
     /// slice**; `truncated` is true even on the last non-empty slice and must
     /// not be used as the stop condition (official Fungi byte-paging guide).
     pub fn download_output(&self, print_id: &str) -> Result<Vec<u8>, Error> {
+        self.download_matching_output(print_id, None)
+    }
+
+    fn download_matching_output(
+        &self,
+        print_id: &str,
+        expected_path: Option<&str>,
+    ) -> Result<Vec<u8>, Error> {
         if !valid_print_id(print_id) {
             return Err(Error::InvalidPrintId);
         }
         let mut out = Vec::new();
         let mut offset: u64 = 0;
-        let mut path: Option<String> = None;
+        let mut path = expected_path.map(str::to_owned);
         let deadline = Instant::now() + DOWNLOAD_BUDGET;
         for _ in 0..=MAX_DOWNLOAD_BYTES / MAX_CHUNK_BYTES + 16 {
             if Instant::now() >= deadline {
@@ -424,6 +450,7 @@ pub struct ModelList {
 pub struct Model {
     pub id: String,
     pub label: Option<String>,
+    pub kind: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -445,6 +472,16 @@ pub struct OutputItem {
     pub print: PrintRecord,
     /// Absolute path inside the admitted Computer's Prints library.
     pub path: String,
+    #[serde(default)]
+    pub characters: Vec<String>,
+    pub style: Option<String>,
+    pub typed: Option<TypedPrompt>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TypedPrompt {
+    pub prompt: String,
+    pub references: u8,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -455,6 +492,10 @@ pub struct PrintRecord {
     pub computer_id: String,
     pub kind: String,
     pub model: String,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    #[serde(rename = "durationSeconds")]
+    pub duration_seconds: Option<u32>,
     pub format: String,
     pub bytes: u64,
     #[serde(rename = "createdAt")]

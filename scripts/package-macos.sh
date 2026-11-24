@@ -13,9 +13,28 @@ test -z "$(git status --porcelain)" || {
   exit 1
 }
 revision="$(git rev-parse HEAD)"
-app="dist/Prints Desktop.app"
 archive="prints-desktop-${version}-macos-arm64.zip"
 minimum_os=14.0
+identity="${PRINTS_CODESIGN_IDENTITY:-}"
+notary_profile="${PRINTS_NOTARY_PROFILE:-}"
+if [ -n "$identity" ] || [ -n "$notary_profile" ]; then
+  [[ "$identity" == "Developer ID Application:"* && -n "$notary_profile" ]] || {
+    printf '%s\n' 'Supply a Developer ID Application identity and a notary keychain profile together.' >&2
+    exit 1
+  }
+  signing=developer-id
+else
+  signing=ad-hoc
+fi
+
+stage="$(mktemp -d "${TMPDIR:-/tmp}/prints-macos.XXXXXX")"
+trap 'rm -rf "$stage"' EXIT
+app="$stage/Prints Desktop.app"
+destination="dist/$version/Prints Desktop.app"
+test ! -e "$destination" || {
+  printf 'Remove or move the existing versioned bundle before repackaging: %s\n' "$destination" >&2
+  exit 1
+}
 
 MACOSX_DEPLOYMENT_TARGET="$minimum_os" cargo build --locked --release
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
@@ -24,8 +43,7 @@ install -m 644 LICENSE "$app/Contents/Resources/LICENSE"
 mkdir -p "$app/Contents/Resources/licenses"
 install -m 644 licenses/*.txt "$app/Contents/Resources/licenses/"
 
-iconset="$(mktemp -d "${TMPDIR:-/tmp}/prints-icon.XXXXXX")"
-trap 'rm -rf "$iconset"' EXIT
+iconset="$stage"
 mkdir "$iconset/Prints.iconset"
 for size in 16 32 128 256 512; do
   sips -z "$size" "$size" assets/icon.png --out "$iconset/Prints.iconset/icon_${size}x${size}.png" >/dev/null
@@ -52,14 +70,28 @@ cat > "$app/Contents/Info.plist" <<PLIST
 </dict>
 </plist>
 PLIST
-printf 'version=%s\nsource=%s\nplatform=macos-arm64\nsigning=ad-hoc\n' "$version" "$revision" > "$app/Contents/Resources/build.txt"
+printf 'version=%s\nsource=%s\nplatform=macos-arm64\nsigning=%s\n' "$version" "$revision" "$signing" > "$app/Contents/Resources/build.txt"
 
 plutil -lint "$app/Contents/Info.plist"
-codesign --force --sign - "$app"
+if [ "$signing" = developer-id ]; then
+  codesign --force --options runtime --timestamp --sign "$identity" "$app"
+  ditto -c -k --sequesterRsrc --keepParent "$app" "$stage/notary.zip"
+  xcrun notarytool submit "$stage/notary.zip" --keychain-profile "$notary_profile" --wait
+  xcrun stapler staple "$app"
+  xcrun stapler validate "$app"
+  spctl --assess --type execute "$app"
+else
+  codesign --force --sign - "$app"
+fi
 codesign --verify --strict "$app"
-ditto -c -k --sequesterRsrc --keepParent "$app" "dist/$archive"
+test "$(git rev-parse HEAD)" = "$revision"
+test -z "$(git status --porcelain)"
+ditto -c -k --sequesterRsrc --keepParent "$app" "$stage/$archive"
+mkdir -p "dist/$version"
+mv "$app" "$destination"
+mv "$stage/$archive" "dist/$archive"
 (
   cd dist
   shasum -a 256 "$archive" > "$archive.sha256"
 )
-printf 'Created %s and %s\n' "$app" "dist/$archive"
+printf 'Created %s and %s\n' "$destination" "dist/$archive"

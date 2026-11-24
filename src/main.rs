@@ -6,6 +6,8 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::Arc;
 
+mod hosted;
+
 use rune::prefs::Prefs;
 use rune::tok::TextStyle;
 use rune::{
@@ -82,6 +84,7 @@ enum Screen {
     Preview,
     Draft,
     Connection,
+    Hosted,
 }
 
 struct Print {
@@ -106,6 +109,7 @@ struct Studio {
     prefs: Prefs,
     cache: Option<ImageCache>,
     proof: bool,
+    hosted: hosted::Hosted,
 }
 
 impl Studio {
@@ -124,6 +128,7 @@ impl Studio {
         favourites.dedup();
         let theme_light = prefs.get("light").unwrap_or(false);
         let draft = TextEdit::new(prefs.get::<String>("draft").unwrap_or_default());
+        let hosted = hosted::Hosted::new(&prefs);
         Self {
             shelf: Shelf::Samples,
             screen: Screen::Workspace,
@@ -138,10 +143,12 @@ impl Studio {
             prefs,
             cache: None,
             proof,
+            hosted,
         }
     }
 
     fn load(&mut self, wake: Waker) {
+        self.hosted.set_waker(wake.clone());
         let cache = ImageCache::new(wake);
         self.assets = AFTERLIGHT
             .iter()
@@ -583,6 +590,19 @@ fn rail(s: &Studio, p: Ink) -> El {
                 s.screen = Screen::Draft;
             },
         ))
+        .child(nav(
+            "hosted-library",
+            "Prints library",
+            s.screen == Screen::Hosted,
+            p,
+            |s, _| {
+                s.screen = if s.hosted.connected() {
+                    Screen::Hosted
+                } else {
+                    Screen::Connection
+                }
+            },
+        ))
         .child(el().grow(1.0))
         .child(nav(
             "theme",
@@ -612,7 +632,16 @@ fn rail(s: &Studio, p: Ink) -> El {
                 .px(4.0)
                 .pt(8.0)
                 .child(el().size(6.0, 6.0).radius(3.0).fill(p.accent))
-                .child(label("Offline workspace", 11.0, 550.0, p.muted)),
+                .child(label(
+                    if s.hosted.connected() {
+                        "Prints connected"
+                    } else {
+                        "Offline workspace"
+                    },
+                    11.0,
+                    550.0,
+                    p.muted,
+                )),
         )
 }
 
@@ -841,7 +870,15 @@ fn workspace(s: &Studio, p: Ink) -> El {
             .truncate(),
         )
         .child(label(
-            format!("{} images", visible.len()),
+            format!(
+                "{} {}",
+                visible.len(),
+                if visible.len() == 1 {
+                    "image"
+                } else {
+                    "images"
+                }
+            ),
             11.0,
             550.0,
             p.muted,
@@ -977,18 +1014,6 @@ fn drafting(s: &Studio, p: Ink) -> El {
         )
 }
 
-fn connection(p: Ink) -> El {
-    col().key("connection-view").w_full().h_full().grow(1.0).padding(22.0).gap(15.0)
-        .child(label("Connect Prints", 36.0, 650.0, p.primary))
-        .child(label("This preview opens the Afterlight collection and images on your device.", 16.0, 550.0, p.primary).wrap())
-        .child(label("Hosted Prints access requires a compatible Oyster installation, a scoped Prints App key and an admitted Computer. Hosted generation may use provider credits and Cloudflare resources.", 14.0, 450.0, p.muted).w(500.0).wrap())
-        .child(row().gap(8.0)
-            .child(action("setup-guide", "Read the Prints setup guide", p, true, |_, tx| {
-                let _ = tx.open_url("https://docs.fungi.computer/apps/prints");
-            }))
-            .child(action("return-afterlight", "Open Afterlight", p, false, |s, _| s.show_shelf(Shelf::Samples))))
-}
-
 fn view(s: &Studio, _: &mut Cx<Studio>) -> El {
     let p = Ink::new(s.theme_light);
     let mut shell = row().key("workspace").h_full().w_full().fill(p.bg);
@@ -1006,11 +1031,13 @@ fn view(s: &Studio, _: &mut Cx<Studio>) -> El {
             }
         }
         Screen::Draft => shell = shell.child(drafting(s, p)),
-        Screen::Connection => shell = shell.child(connection(p)),
+        Screen::Connection => shell = shell.child(hosted::connection(s, p)),
+        Screen::Hosted => shell = shell.child(hosted::library(s, p)),
         Screen::Preview => unreachable!(),
     }
     shell.on_drop_files(|s: &mut Studio, paths, _| {
-        if let Some(path) = paths.first()
+        if s.screen == Screen::Workspace
+            && let Some(path) = paths.first()
             && let Err(err) = s.import(path)
         {
             s.status = err.into();
@@ -1046,6 +1073,7 @@ fn main() {
     App::new(AppSpec {
         min_size: Some((940.0, 660.0)),
         setup: Some(Studio::load),
+        poll: Some(hosted::poll),
         on_key: Some(keyboard),
         scenes: &[("light", |s| s.theme_light = true)],
         ..AppSpec::new("Prints Desktop", (1350.0, 830.0), Studio::new, view)

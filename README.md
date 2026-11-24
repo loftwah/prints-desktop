@@ -14,7 +14,7 @@ ecosystem.
 
 ## Download
 
-Open the [preview release](https://github.com/loftwah/prints-desktop/releases/tag/v0.1.0)
+Open the [preview release](https://github.com/loftwah/prints-desktop/releases/tag/v0.2.0)
 for platform details and SHA-256 checksums. On Apple Silicon, extract the ZIP
 and open `Prints Desktop.app`. The preview uses an ad-hoc signature and is
 unnotarised. Check the checksum before installing. See [Apple's Gatekeeper
@@ -32,12 +32,14 @@ the Xcode command-line tools.
 ```sh
 cargo run --locked
 scripts/check-workspace.sh
+python3 scripts/check-connected-workspace.py
 cargo run --locked -- --snap prints.png --size 1360x840 --settle
 scripts/package-macos.sh
 ```
 
-The workspace replay requires Bash and Python 3. Packaging on Apple Silicon writes a signed local bundle, ZIP and checksum to
-`dist/`. Rune's debug build also provides `--tree` and `--script` for
+The workspace replays require Bash and Python 3. The connected replay
+uses a fictional loopback Oyster. Packaging on Apple Silicon writes the app to
+`dist/<version>/` and the ZIP and SHA-256 checksum to `dist/`. Rune's debug build also provides `--tree` and `--script` for
 inspecting the window and replaying input. The bundle contains its release
 version and Git revision in `Contents/Resources/build.txt`.
 
@@ -45,8 +47,12 @@ version and Git revision in `Contents/Resources/build.txt`.
 
 - **Apple Silicon macOS** · `scripts/package-macos.sh` creates the app and archive.
   It targets macOS 14 or later. The release notes identify the tested OS.
+  A public Developer ID build uses `PRINTS_CODESIGN_IDENTITY` and
+  `PRINTS_NOTARY_PROFILE` with an installed Developer ID Application
+  certificate and a preconfigured notary profile in Keychain. The packaging
+  script submits, staples and assesses that build before writing its archive.
 - **Linux ARM64** · Build with `cargo build --locked --release` using Rust 1.99.1.
-  On Debian, install `libxkbcommon-dev` and `libwayland-dev` to compile.
+  On Debian, install `libdbus-1-dev`, `libxkbcommon-dev` and `libwayland-dev` to compile.
   A graphical session needs the X11 or Wayland client libraries and working
   graphics drivers. Native Open and Save use the XDG desktop portal.
   `scripts/package-portable.sh linux-arm64 target/release/prints-desktop`
@@ -58,7 +64,17 @@ version and Git revision in `Contents/Resources/build.txt`.
 
 ## Hosted Prints
 
-This preview explores local artwork. The connection screen links to upstream setup.
+From **Connect Prints**, enter your Oyster origin, Prints installation ID and
+named App key scoped to that installation. Browse indexed files, inspect media
+and prompt metadata, view supported image previews and export originals. Choose
+whether to keep the key in the system credential store. A working Secret
+Service is required to remember a connection on Linux.
+
+The connected preview opens the signed-in web Prints app for creation. Oyster
+identifies named App keys as Team keys and the supported Prints release declines
+generation from that actor type. Native generation requires a supported
+scoped member or agent sign-in.
+
 Oyster is Fungi's app platform. It runs Prints and authorises access to its
 library, model catalogue and selected Computer. Darkroom supplies provider
 adapters. A compatible installation and scoped credentials are required to
