@@ -21,6 +21,8 @@ unnotarised. Check the checksum before installing. See [Apple's Gatekeeper
 guidance](https://support.apple.com/en-au/102445) for the prompts macOS may
 show for a downloaded preview.
 
+See the [App Composer showcase and walkthrough](https://composer.loftwah.com/prints-desktop).
+
 ## Build and inspect
 
 Install Rust through [rustup](https://rustup.rs/). This checkout selects Rust
@@ -66,6 +68,9 @@ Exploring the offline workspace incurs no inference or Cloudflare usage.
 See Fungi's [Prints and Workers AI guide](https://docs.fungi.computer/apps/prints)
 for what it takes to set up your own backend. Upstream host, storage,
 Computer and inference costs depend on the configuration.
+
+The [read-only Oyster diagnostic](docs/oyster.md) documents the scoped connection,
+supported methods and verification steps for developers.
 
 Follow [the project issue](https://github.com/loftwah/app-composer/issues/1292)
 for delivery evidence and integration status. See [artwork provenance](assets/README.md)
