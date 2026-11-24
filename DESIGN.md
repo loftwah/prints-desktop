@@ -15,7 +15,7 @@ navigation and export.
 
 No ambient motion. Keyboard navigation shares the same selection state as
 mouse and touchpad input. Native file dialogs leave the gallery visible.
-The contact sheet and comparison views take the remaining width while the
+The gallery takes the remaining width while the
 inspector can be hidden. Samples are available at first launch.
 
 See the [artwork credit](assets/README.md) and the

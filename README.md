@@ -3,7 +3,8 @@
 Open **Afterlight**, six studies in the light that lingers. Browse the contact
 sheet, see a print at full size, keep favourites, and export the included
 JPEGs. Bring an image from your own machine or use a sample's prompt as a
-starting point for an editable, local draft.
+starting point for an editable, local draft. Sample favourites and saved drafts
+reopen on this device. Imports and their favourites last for the current session.
 
 Prints Desktop is a standalone native Rust application built with
 [Anomaly's Rune](https://github.com/anomalyco/rune). Its offline workspace

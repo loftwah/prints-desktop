@@ -118,7 +118,10 @@ impl Studio {
         } else {
             Prefs::open(APP_ID)
         };
-        let favourites: Vec<usize> = prefs.get("favourites").unwrap_or_default();
+        let mut favourites: Vec<usize> = prefs.get("favourites").unwrap_or_default();
+        favourites.retain(|&i| i < AFTERLIGHT.len());
+        favourites.sort_unstable();
+        favourites.dedup();
         let theme_light = prefs.get("light").unwrap_or(false);
         let draft = TextEdit::new(prefs.get::<String>("draft").unwrap_or_default());
         Self {
@@ -471,10 +474,6 @@ fn export(s: &mut Studio, tx: &mut Tx) {
     let Some(asset) = s.selected.and_then(|i| s.assets.get(i)) else {
         return;
     };
-    if asset.image.error().is_some() {
-        s.status = "This image could not be decoded.".into();
-        return;
-    }
     let filename = asset.filename.clone();
     let bytes = asset.bytes.clone();
     tx.save_file(
@@ -673,10 +672,10 @@ fn inspector(s: &Studio, asset: &Print, p: Ink) -> El {
         )
         .child(action(
             "favourite",
-            if is_favourite {
-                "Remove favourite"
-            } else {
-                "Add to favourites"
+            match (is_favourite, asset.study.is_some()) {
+                (true, _) => "Remove favourite",
+                (false, true) => "Add to favourites",
+                (false, false) => "Favourite for this session",
             },
             p,
             false,
@@ -1032,7 +1031,9 @@ fn keyboard(s: &mut Studio, event: &KeyEvent, tx: &mut Tx) -> bool {
         }
         Key::Left if matches!(s.screen, Screen::Workspace | Screen::Preview) => s.step(-1),
         Key::Right if matches!(s.screen, Screen::Workspace | Screen::Preview) => s.step(1),
-        Key::Enter if s.screen == Screen::Workspace && s.selected.is_some() => {
+        Key::Enter
+            if s.screen == Screen::Workspace && s.selected.is_some() && tx.focused().is_none() =>
+        {
             s.screen = Screen::Preview
         }
         _ => return false,
