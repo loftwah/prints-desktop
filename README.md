@@ -20,7 +20,7 @@ ecosystem.
 
 ## Download
 
-Open the [preview release](https://github.com/loftwah/prints-desktop/releases/tag/v0.3.0)
+Open the [preview release](https://github.com/loftwah/prints-desktop/releases/tag/v0.3.1)
 for platform details and SHA-256 checksums. On Apple Silicon, extract the ZIP
 and open `Prints Desktop.app`. The preview uses an ad-hoc signature and is
 unnotarised. Check the checksum before installing. See [Apple's Gatekeeper
