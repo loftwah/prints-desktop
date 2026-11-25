@@ -16,7 +16,8 @@ def replay(run, actions):
     steps = run / "steps.json"
     tree = run / "tree.json"
     steps.write_text(json.dumps([
-        {"t": time, "type": event, **details}
+        {"t": time, "drop_files": details} if event == "drop_files"
+        else {"t": time, "type": event, **details}
         for time, event, details in actions
     ]))
     subprocess.run(
@@ -75,4 +76,29 @@ with TemporaryDirectory(prefix="prints-local-library-") as temporary:
     no_items = replay(run, [(0.2, "tap", {"key": "favourites"})])
     assert "Select Evening" not in json.dumps(no_items)
 
-print("Local library replay passed across restarts. Relocation and removal preserved the original.")
+    images = [run / f"Batch {i:02}.jpg" for i in range(1, 14)]
+    for image in images:
+        image.write_bytes(ORIGINAL)
+    unsupported = run / "notes.txt"
+    unsupported.write_text("Not an image")
+    paths = [unsupported, images[0], images[0], *images[1:]]
+    batch = replay(run, [
+        (0.2, "drop_files", {"at": [390, 280], "paths": [str(path) for path in paths]}),
+    ])
+    text_in(batch, "Linked 12 of 15 files. Library limit: 12.")
+    persisted = replay(run, [(0.2, "tap", {"key": "imports"})])
+    for image in images[:12]:
+        text_in(persisted, f"Select {image.stem}")
+        assert image.read_bytes() == ORIGINAL
+    assert "Select Batch 13" not in json.dumps(persisted)
+
+    compared = replay(run, [
+        (0.2, "tap", {"key": "imports"}),
+        (0.4, "tap", {"key": "choose-comparison"}),
+        (0.6, "tap", {"key": "print-12"}),
+        (0.8, "tap", {"key": "compare-local"}),
+    ])
+    for expected in ("local-comparison", "Batch 01.jpg", "Batch 02.jpg"):
+        text_in(compared, expected)
+
+print("Local imports, comparisons, restart, relocation and original preservation passed.")

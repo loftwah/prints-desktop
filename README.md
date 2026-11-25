@@ -15,7 +15,7 @@ Prints is a native workbench for image makers. Compare a cover and its release p
 | If you want to… | Start here |
 | --- | --- |
 | **See what the UI does** | Open the [creative archive in your browser](https://prints.loftwah.com/#archive). Follow the [native walkthrough](https://prints.loftwah.com/#walkthrough) to compare **Higher Than Before** and export an original. |
-| **Work offline** | Download the preview and link up to 12 JPEG, PNG or WebP originals from your computer. The offline library needs no account, wallet, token, or model credits. |
+| **Work offline** | Download the preview and drop up to 12 JPEG, PNG or WebP originals into the workspace. Choose **Set first image**, select another original and choose **Compare images**. The offline library needs no account, wallet, token, or model credits. |
 | **Work with an agent** | Connect an approved client to your Oyster host’s `/mcp` endpoint with a Prints-scoped key. Start with the read-only `execute` example in the [Oyster guide](https://docs.fungi.computer/guides/call-an-app-from-your-own-server). |
 | **Use Shiitake** | Open Shiitake in your project folder and give it the release art brief below. For your first tool call, use your own authorised Fungi Team or Oyster connection. [Shiitake terminal guide](https://docs.fungi.computer/guides/use-the-terminal) |
 | **Build with AI** | Start with one brief and one target size. Create through web Prints, then inspect the resulting file in the desktop app. [Open Prints and choose a prompt](https://prints.loftwah.com/) |
@@ -45,15 +45,15 @@ The desktop app reads compatible Oyster libraries and hands creation off to sign
 
 ## Get the preview
 
-Get the archives and SHA-256 checksums from the [v0.4.1 release](https://github.com/loftwah/prints-desktop/releases/tag/v0.4.1).
+Get the archives, SHA-256 checksums and platform verification details from the [v0.4.2 release](https://github.com/loftwah/prints-desktop/releases/tag/v0.4.2).
 
 | Platform | Run it | Verified |
 | --- | --- | --- |
-| **Apple Silicon Mac** · macOS 14+ | Extract the ZIP and open `Prints Desktop.app`. [Gatekeeper guidance](https://support.apple.com/en-au/102445) | The extracted app opened on Apple Silicon macOS 26.6.2 and exported the bundled Fighter PNG byte for byte through the native Save dialog. Ad-hoc signed and unnotarised. |
-| **Linux** · x64 or ARM64 | Extract the tarball and run `prints-desktop` in a graphical session. [Runtime prerequisites](CONTRIBUTING.md#platform-setup) | Both packages opened in Debian graphical test sessions. Find and Escape worked, and the x64 session used OrbStack CPU translation. |
+| **Apple Silicon Mac** · macOS 14+ | Extract the ZIP and open `Prints Desktop.app`. [Gatekeeper guidance](https://support.apple.com/en-au/102445) | Ad-hoc signed and unnotarised. See the release for the Mac checks on this build. |
+| **Linux** · x64 or ARM64 | Extract the tarball and run `prints-desktop` in a graphical session. [Runtime prerequisites](CONTRIBUTING.md#platform-setup) | See the release for Debian graphical verification and x64 translation coverage. |
 | **Windows** · x64 | Extract the ZIP and run `prints-desktop.exe`. | Unsigned x64 cross-build. Archive and embedded source checks passed. A Windows desktop launch is unverified. |
 
-If Gatekeeper blocks the Mac ZIP, build the `v0.4.1` tag with the free Xcode command-line tools and Rust, or try the contact sheet in your browser. A local build needs no Apple Developer Program membership. [Install guide and exact build commands](https://prints.loftwah.com/guide#install)
+If Gatekeeper blocks the Mac ZIP, build the `v0.4.2` tag with the free Xcode command-line tools and Rust, or try the contact sheet in your browser. A local build needs no Apple Developer Program membership. [Install guide and exact build commands](https://prints.loftwah.com/guide#install)
 
 [Windows desktop verification](https://github.com/loftwah/prints-desktop/issues/7) · [Public download counts](https://prints.loftwah.com/downloads) · [v0.4.1 benchmark baseline](docs/preview-benchmark.md)
 
