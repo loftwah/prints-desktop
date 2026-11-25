@@ -14,12 +14,12 @@ fn first_local(s: &Studio) -> Option<usize> {
     let path = s.comparison_first.as_deref()?;
     s.assets
         .iter()
-        .position(|asset| asset.path() == Some(path) && asset.picture().is_some())
+        .position(|asset| asset.path() == Some(path) && asset.available())
 }
 
 pub(crate) fn caption(s: &Studio, asset: &Print) -> String {
     if asset.path().is_some()
-        && asset.picture().is_some()
+        && asset.available()
         && let Some(first) = first_local(s)
     {
         return if s.selected == Some(first) {
@@ -49,7 +49,9 @@ pub(crate) fn control(s: &Studio, asset: &Print, p: Ink) -> Option<El> {
     }
     let current = s.selected?;
     let path = asset.path()?.to_path_buf();
-    asset.picture()?;
+    if !asset.available() {
+        return None;
+    }
     let button = match first_local(s) {
         None => action(
             "choose-comparison",
@@ -73,7 +75,7 @@ pub(crate) fn control(s: &Studio, asset: &Print, p: Ink) -> Option<El> {
     Some(button)
 }
 
-fn panel(asset: &Print, title: &str, p: Ink) -> El {
+fn panel(s: &Studio, asset: &Print, title: &str, p: Ink) -> El {
     col()
         .grow(1.0)
         .shrink()
@@ -84,7 +86,7 @@ fn panel(asset: &Print, title: &str, p: Ink) -> El {
             el().w_full()
                 .grow(1.0)
                 .shrink()
-                .child(photo(asset, SurfaceFit::Fit, p)),
+                .child(photo(s, asset, SurfaceFit::Fit, p)),
         )
         .child(label(&asset.filename, 12.0, 500.0, p.muted).truncate_middle())
 }
@@ -121,8 +123,8 @@ pub(crate) fn view(s: &Studio, pair: Pair, p: Ink) -> El {
                 .grow(1.0)
                 .shrink()
                 .gap(15.0)
-                .child(panel(first, first_title, p))
-                .child(panel(second, second_title, p))
+                .child(panel(s, first, first_title, p))
+                .child(panel(s, second, second_title, p))
         }
         _ => label(
             "The comparison formats are unavailable.",

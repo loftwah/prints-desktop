@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-pub const MAX_REFS: usize = 12;
+pub const MAX_REFS: usize = 300;
 pub const LIBRARY_KEY: &str = "linked-originals";
 
 #[derive(Deserialize, Serialize)]
