@@ -1906,6 +1906,9 @@ fn keyboard(s: &mut Studio, event: &KeyEvent, tx: &mut Tx) -> bool {
             s.clear_search();
             tx.blur();
         }
+        Key::Escape if matches!(s.screen, Screen::Compare(_)) => {
+            comparison::return_to_workspace(s, tx);
+        }
         Key::Escape if s.screen != Screen::Workspace => {
             s.screen = Screen::Workspace;
             tx.blur();

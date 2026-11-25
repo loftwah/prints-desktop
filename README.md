@@ -4,15 +4,15 @@
 
 **TL;DR** · Drop in a few exports or AI variants, compare them side by side and take the exact original with you. Prints works offline without an account. Connect your own Oyster library to browse and export generated work.
 
-[Try the browser demo](https://prints.loftwah.com/#afterlight) · [Download the desktop preview](https://github.com/loftwah/prints-desktop/releases/tag/v0.4.2) · [Contribute](CONTRIBUTING.md)
+[Try the browser demo](https://prints.loftwah.com/#afterlight) · [Download the desktop preview](https://github.com/loftwah/prints-desktop/releases/tag/v0.5.0) · [Contribute](CONTRIBUTING.md)
 
 ## Quickstarts
 
-- **Desktop.** [Download the matching archive](https://github.com/loftwah/prints-desktop/releases/tag/v0.4.2) and [open Prints](https://prints.loftwah.com/guide#install). In **Creative Archive**, pick **Higher Than Before**, choose **Compare formats**, then return to the contact sheet and choose **Export original**.
+- **Desktop.** [Download the matching archive](https://github.com/loftwah/prints-desktop/releases/tag/v0.5.0) and [open Prints](https://prints.loftwah.com/guide#install). In **Creative Archive**, pick **Higher Than Before**, choose **Compare formats**, then return to the contact sheet and choose **Export original**.
 - **Build from GitHub.** Install [Rust with rustup](https://rustup.rs/) and check the [platform prerequisites](CONTRIBUTING.md#platform-setup). Clone the release tag and run the locked build.
 
   ```sh
-  git clone --branch v0.4.2 --depth 1 https://github.com/loftwah/prints-desktop.git
+  git clone --branch v0.5.0 --depth 1 https://github.com/loftwah/prints-desktop.git
   cd prints-desktop
   cargo run --locked
   ```
@@ -28,7 +28,8 @@
 | If you want to… | Start here |
 | --- | --- |
 | **See what the UI does** | Open the [creative archive in your browser](https://prints.loftwah.com/#archive). Follow the [native walkthrough](https://prints.loftwah.com/#walkthrough) to compare **Higher Than Before** and export an original. |
-| **Work offline** | Download the preview and drop up to 12 JPEG, PNG or WebP originals into the workspace. Choose **Set first image**, select another original and choose **Compare images**. The offline library needs no account, wallet, token, or model credits. |
+| **Work offline** | Download the preview and drop up to 300 JPEG, PNG or WebP originals into the workspace. Choose **Set first image**, select another original and choose **Compare images**. The offline library needs no account, wallet, token, or model credits. |
+| **Resume a draft** | Choose **Keep with draft** in each image’s details. Open **Prompt draft** to save your brief and return to the shortlisted originals after reopening Prints. |
 | **Browse an Oyster library in the app** | Open **Connect Prints** and use a scoped App key for your installation. [Desktop connection steps](docs/oyster.md) |
 | **Use Shiitake** | Open Shiitake in your project folder and give it the release art brief below. For your first tool call, use your own authorised Fungi Team or Oyster connection. [Shiitake terminal guide](https://docs.fungi.computer/guides/use-the-terminal) |
 | **Build with AI** | Start with one brief and one target size. Create through web Prints, then inspect the resulting file in the desktop app. [Open Prints and choose a prompt](https://prints.loftwah.com/) |
@@ -58,7 +59,7 @@ The desktop app reads compatible Oyster libraries and hands creation off to sign
 
 ## Get the preview
 
-Get the archives, SHA-256 checksums and platform verification details from the [v0.4.2 release](https://github.com/loftwah/prints-desktop/releases/tag/v0.4.2).
+Get the archives, SHA-256 checksums and platform verification details from the [v0.5.0 release](https://github.com/loftwah/prints-desktop/releases/tag/v0.5.0).
 
 | Platform | Run it | Verified |
 | --- | --- | --- |
@@ -66,7 +67,7 @@ Get the archives, SHA-256 checksums and platform verification details from the [
 | **Linux** · x64 or ARM64 | Extract the tarball and run `prints-desktop` in a graphical session. [Runtime prerequisites](CONTRIBUTING.md#platform-setup) | See the release for Debian graphical verification and x64 translation coverage. |
 | **Windows** · x64 | Extract the ZIP and open `Prints Desktop.exe`. | Unsigned x64 cross-build. Archive and embedded source checks passed. A Windows desktop launch is unverified. |
 
-If Gatekeeper blocks the Mac ZIP, build the `v0.4.2` tag with the free Xcode command-line tools and Rust, or try the contact sheet in your browser. A local build needs no Apple Developer Program membership. [Install guide and exact build commands](https://prints.loftwah.com/guide#install)
+If Gatekeeper blocks the Mac ZIP, build the `v0.5.0` tag with the free Xcode command-line tools and Rust, or try the contact sheet in your browser. A local build needs no Apple Developer Program membership. [Install guide and exact build commands](https://prints.loftwah.com/guide#install)
 
 [Windows desktop verification](https://github.com/loftwah/prints-desktop/issues/7) · [Public download counts](https://prints.loftwah.com/downloads) · [v0.4.1 benchmark baseline](docs/preview-benchmark.md)
 
