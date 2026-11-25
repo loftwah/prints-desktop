@@ -4,7 +4,7 @@
 
 Prints is a native workbench for image makers. Compare a cover and its release poster side by side, shortlist the versions worth keeping, and export the original file byte for byte. Open it offline to explore finished work from LoftwahFM, Fighter, and Bubbles, or bring your own images.
 
-[Download the desktop preview](https://github.com/loftwah/prints-desktop/releases) · [Watch the 15-second tour](https://prints.loftwah.com/watch) · [Make your first poster](https://prints.loftwah.com/make) · [Contribute](CONTRIBUTING.md)
+[Visit prints.loftwah.com](https://prints.loftwah.com/) · [Preview releases](https://github.com/loftwah/prints-desktop/releases) · [Contribute](CONTRIBUTING.md)
 
 ![The native Prints Desktop workspace. The Loftwah Creative Archive shows the Higher Than Before album cover, its contact sheet and original-export control.](docs/screenshots/creative-archive-v0.4.0.webp)
 
@@ -18,7 +18,7 @@ Prints is a native workbench for image makers. Compare a cover and its release p
 | **Work offline** | Download the preview and import a JPEG, PNG or WebP from your computer. The offline library needs no account, wallet, token, or model credits. |
 | **Work with an agent** | Connect an approved client to your Oyster host’s `/mcp` endpoint with a Prints-scoped key. Start with the read-only `execute` example in the [Oyster guide](https://docs.fungi.computer/guides/call-an-app-from-your-own-server). |
 | **Use Shiitake** | Open Shiitake in your project folder and give it the release art brief below. For your first tool call, use your own authorised Fungi Team or Oyster connection. [Shiitake terminal guide](https://docs.fungi.computer/guides/use-the-terminal) |
-| **Build with AI** | Start with one brief and one target size. Create through web Prints, then inspect the resulting file in the desktop app. [Make an image with Prints](https://prints.loftwah.com/make) |
+| **Build with AI** | Start with one brief and one target size. Create through web Prints, then inspect the resulting file in the desktop app. [Open Prints and choose a prompt](https://prints.loftwah.com/) |
 | **Run the stack yourself** | Start with the free local Oyster trial. Add an authorised Workers AI model when you need generation and use AI Gateway when you need to observe supported requests. [Oyster trial](https://docs.fungi.computer/oyster-quickstart) · [Prints on Cloudflare](https://docs.fungi.computer/apps/prints) |
 
 ### Try a real brief
