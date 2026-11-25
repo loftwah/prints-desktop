@@ -365,15 +365,15 @@ impl Studio {
     }
 
     /// Point this reference at a new canonical path chosen by the user.
-    fn relocate(&mut self, path: &Path) {
-        let Some(index) = self.selected else { return };
-        if self
+    fn relocate(&mut self, previous: &Path, path: &Path) {
+        let Some(index) = self
             .assets
-            .get(index)
-            .is_none_or(|asset| asset.study.is_some())
-        {
+            .iter()
+            .position(|asset| asset.source.as_deref() == Some(previous))
+        else {
+            self.status = "That entry is no longer in the local library.".into();
             return;
-        }
+        };
         let source = match local::canonical(path) {
             Some(source) => source,
             None => {
@@ -717,14 +717,21 @@ fn file_open(_: &mut Studio, tx: &mut Tx) {
 
 /// Explicit recovery for a saved original that moved: the dialog shows the
 /// path because the user asked to locate it; no path enters the UI copy.
-fn locate(_: &mut Studio, tx: &mut Tx) {
+fn locate(s: &mut Studio, tx: &mut Tx) {
+    let Some(previous) = s
+        .selected
+        .and_then(|i| s.assets.get(i))
+        .and_then(|asset| asset.source.clone())
+    else {
+        return;
+    };
     let options = FileDialogOptions {
         title: "Locate the original".into(),
         ..Default::default()
     }
     .filter("Images", &["jpg", "jpeg", "png", "webp"]);
-    tx.open_file(options, |s: &mut Studio, answer, _| match answer {
-        Ok(Some(path)) => s.relocate(&path),
+    tx.open_file(options, move |s: &mut Studio, answer, _| match answer {
+        Ok(Some(path)) => s.relocate(&previous, &path),
         Ok(None) => (),
         Err(_) => s.status = "The system could not show the Open dialog.".into(),
     });
