@@ -10,6 +10,7 @@ mod archive;
 mod comparison;
 mod disk;
 use disk::OriginalWrite;
+mod draft;
 mod hosted;
 mod local;
 mod local_images;
@@ -257,6 +258,7 @@ struct Studio {
     inspector: bool,
     draft: TextEdit,
     draft_dirty: bool,
+    draft_shortlist: Vec<usize>,
     search: Search,
     status: String,
     prefs: Prefs,
@@ -314,6 +316,7 @@ impl Studio {
             inspector: true,
             draft,
             draft_dirty: false,
+            draft_shortlist: Vec::new(),
             search: Search::default(),
             status: String::new(),
             prefs,
@@ -352,6 +355,7 @@ impl Studio {
                 Original::Edition(edition, Picture::new(edition.bytes.into(), &cache)),
             )
         }));
+        draft::restore_bundled(self);
         if self.proof {
             for picture in self.assets.iter().filter_map(Print::picture) {
                 let _ = picture.image.wait();
@@ -368,6 +372,9 @@ impl Studio {
         for record in local::read(self.prefs.get(local::LIBRARY_KEY)) {
             if record.favourite {
                 self.favourites.push(self.assets.len());
+            }
+            if record.in_draft {
+                self.draft_shortlist.push(self.assets.len());
             }
             self.assets.push(Print::linked(record.path, None));
         }
@@ -443,6 +450,7 @@ impl Studio {
                 Some(local::Reference {
                     path: asset.path()?.to_path_buf(),
                     favourite: self.favourites.contains(&index),
+                    in_draft: self.draft_shortlist.contains(&index),
                 })
             })
             .collect();
@@ -748,6 +756,7 @@ impl Studio {
         }
         self.local_images.invalidate(path);
         self.assets.remove(index);
+        let removed_from_draft = draft::forget_asset(self, index);
         self.favourites.retain(|&i| i != index);
         for favourite in &mut self.favourites {
             if *favourite > index {
@@ -756,25 +765,30 @@ impl Studio {
         }
         self.sync_selection();
         if self.persist_local() {
-            self.status = "Removed from library. Your original file is unchanged.".into();
+            self.status = if removed_from_draft {
+                "Removed from the library and draft. Your original file is unchanged.".into()
+            } else {
+                "Removed from library. Your original file is unchanged.".into()
+            };
         }
     }
 
     fn use_prompt(&mut self) {
-        let Some(study) = self
-            .selected
-            .and_then(|i| self.assets.get(i))
-            .and_then(Print::study)
-        else {
+        let Some(index) = self.selected else { return };
+        let Some(study) = self.assets.get(index).and_then(Print::study) else {
             return;
         };
         if self.draft.text.trim().is_empty() {
             self.draft = TextEdit::new(study.prompt);
             self.draft_dirty = true;
             self.status.clear();
+            if !self.draft_shortlist.contains(&index) {
+                draft::toggle(self, index);
+            }
         } else {
             self.status = "Your draft is still here. Clear it first to use this brief.".into();
         }
+        self.open_local_library();
         self.screen = Screen::Draft;
     }
 
@@ -1279,6 +1293,7 @@ fn rail(s: &Studio, p: Ink) -> El {
             s.screen == Screen::Draft,
             p,
             |s, _| {
+                s.open_local_library();
                 s.status.clear();
                 s.screen = Screen::Draft;
             },
@@ -1424,7 +1439,8 @@ fn inspector(s: &Studio, asset: &Print, p: Ink) -> El {
             p,
             false,
             |s, _| s.favourite(),
-        ));
+        ))
+        .child(draft::action_for_selection(s, p));
     if s.original(asset).is_some() {
         actions = actions.child(export_action(s, "export", p));
     }
@@ -1804,7 +1820,7 @@ fn drafting(s: &Studio, p: Ink) -> El {
         .child(label("Prompt draft", 36.0, 650.0, p.primary))
         .child(
             label(
-                "Write a brief of your own, or start from an Afterlight print.",
+                "Keep your brief and image choices together.",
                 14.0,
                 450.0,
                 p.muted,
@@ -1816,7 +1832,7 @@ fn drafting(s: &Studio, p: Ink) -> El {
                 .key("draft-input")
                 .label("Prompt draft")
                 .w_full()
-                .h(220.0)
+                .h(188.0)
                 .padding(16.0)
                 .radius(10.0)
                 .fill(p.field)
@@ -1847,6 +1863,7 @@ fn drafting(s: &Studio, p: Ink) -> El {
                 }))
                 .child(label(&s.status, 12.0, 500.0, p.muted).wrap()),
         )
+        .child(draft::shortlist(s, p))
 }
 
 fn view(s: &Studio, _: &mut Cx<Studio>) -> El {
