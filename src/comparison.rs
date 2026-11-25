@@ -1,4 +1,4 @@
-use rune::{El, SurfaceFit, col, el, row};
+use rune::{El, SurfaceFit, Tx, col, el, row};
 
 use crate::{Ink, Print, Screen, Studio, action, label, photo};
 
@@ -8,6 +8,21 @@ const CAMPAIGN_PRINTS: [&str; 2] = ["higher-than-before.jpg", "higher-than-befor
 pub(crate) enum Pair {
     Campaign,
     Local(usize, usize),
+}
+
+fn open(s: &mut Studio, tx: &mut Tx, pair: Pair) {
+    s.screen = Screen::Compare(pair);
+    tx.focus("close-comparison", tx.by_keys() || tx.focus_visible());
+}
+
+pub(crate) fn return_to_workspace(s: &mut Studio, tx: &mut Tx) {
+    let key = match s.screen {
+        Screen::Compare(Pair::Campaign) => "compare-editions",
+        Screen::Compare(Pair::Local(..)) => "compare-local",
+        _ => return,
+    };
+    s.screen = Screen::Workspace;
+    tx.focus(key, tx.by_keys() || tx.focus_visible());
 }
 
 fn first_local(s: &Studio) -> Option<usize> {
@@ -41,10 +56,7 @@ pub(crate) fn control(s: &Studio, asset: &Print, p: Ink) -> Option<El> {
             "Compare formats",
             p,
             false,
-            |s, tx| {
-                s.screen = Screen::Compare(Pair::Campaign);
-                tx.blur();
-            },
+            |s, tx| open(s, tx, Pair::Campaign),
         ));
     }
     let current = s.selected?;
@@ -58,18 +70,19 @@ pub(crate) fn control(s: &Studio, asset: &Print, p: Ink) -> Option<El> {
             "Set first image",
             p,
             false,
-            move |s, _| {
+            move |s, tx| {
                 s.comparison_first = Some(path.clone());
+                tx.focus("clear-comparison", tx.by_keys() || tx.focus_visible());
             },
         ),
         Some(first) if first == current => {
-            action("clear-comparison", "Clear comparison", p, false, |s, _| {
+            action("clear-comparison", "Clear comparison", p, false, |s, tx| {
                 s.comparison_first = None;
+                tx.focus("choose-comparison", tx.by_keys() || tx.focus_visible());
             })
         }
         Some(first) => action("compare-local", "Compare images", p, false, move |s, tx| {
-            s.screen = Screen::Compare(Pair::Local(first, current));
-            tx.blur();
+            open(s, tx, Pair::Local(first, current));
         }),
     };
     Some(button)
@@ -156,10 +169,7 @@ pub(crate) fn view(s: &Studio, pair: Pair, p: Ink) -> El {
                     "Back to contact sheet",
                     p,
                     false,
-                    |s, tx| {
-                        s.screen = Screen::Workspace;
-                        tx.blur();
-                    },
+                    return_to_workspace,
                 )),
         )
         .child(panels)
