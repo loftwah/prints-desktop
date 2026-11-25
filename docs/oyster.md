@@ -1,6 +1,6 @@
 # Read-only Oyster connection
 
-Afterlight opens offline. The **Connect Prints** screen accepts a named App
+The Loftwah Creative Archive and Afterlight work offline. The **Connect Prints** screen accepts a named App
 key through a secure input. Choose **Remember key on this device** to save it
 through Keychain, Windows Credential Manager or Linux Secret Service. With that
 option off, the key lives in the connection for the current session. A profile
