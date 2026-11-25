@@ -1,0 +1,24 @@
+name: Report a bug
+description: Tell us what happened in the desktop app, on a platform, or in a guide.
+body:
+  - type: input
+    id: environment
+    attributes:
+      label: Version and platform
+      description: For example, v0.4.0 on macOS 26, Apple Silicon, or main at a commit.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: What did you do?
+      description: Start with the shelf or screen you were using. For a guide, add its title or link.
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: What did you expect, and what happened?
+      description: Include a public-safe screenshot or the exact error if it helps. Keep keys, private artwork, and local file paths out of the report.
+    validations:
+      required: true

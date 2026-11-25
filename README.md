@@ -1,123 +1,72 @@
 # Prints Desktop
 
-Open the **Loftwah Creative Archive** to browse published work from
-LoftwahFM, Fighter and Bubbles. See the original release formats side by side,
-read each piece’s provenance, or keep a favourite and export its exact original
-bytes. The [archive credit](assets/archive/README.md) identifies every source.
-**Afterlight** retains the six studies from the original collection, with
-creative briefs you can copy into an editable local draft.
+**Compare the artwork. Keep the original.**
 
-Use **Find** or Command/Ctrl+F to filter the current shelf. Escape clears
-Find and returns focus to the workspace. Arrow keys step through the shelf,
-and Enter opens full view. On macOS the File, Edit, Library, View and Help
-menus provide the same workspace commands. Archive and Afterlight favourites,
-local imports and their favourites, and saved drafts reopen on this device.
+Prints is a native workbench for image makers. Compare a cover and its release poster side by side, shortlist the versions worth keeping, and export the original file byte for byte. Open it offline to explore finished work from LoftwahFM, Fighter, and Bubbles, or bring your own images.
 
-Local imports keep links to up to 12 original files. The first time you open
-Local imports or Favourites, Prints reads those files from their saved
-locations. If a file is unavailable, choose **Refresh original** to reopen its
-saved location or **Locate original…** to choose its new location. **Remove
-from library** clears the link and its favourite. The original stays on disk.
+[Download the desktop preview](https://github.com/loftwah/prints-desktop/releases) · [Watch the 15-second tour](https://prints.loftwah.com/watch) · [Make your first poster](https://prints.loftwah.com/make) · [Contribute](CONTRIBUTING.md)
 
-Prints Desktop is a standalone native Rust application built with
-[Anomaly's Rune](https://github.com/anomalyco/rune). Its offline workspace
-needs no App Composer account, server or inference credits. It is an
-independent Loftwah project for the [Fungi](https://docs.fungi.computer/)
-ecosystem.
+![The native Prints Desktop workspace. The Loftwah Creative Archive shows the Higher Than Before album cover, its contact sheet and original-export control.](docs/screenshots/creative-archive-v0.4.0.webp)
 
-## Download
+*Prints Desktop v0.4.0 on macOS, with published artwork from the [Loftwah Creative Archive](assets/archive/README.md).*
 
-Open the [preview release](https://github.com/loftwah/prints-desktop/releases)
-for platform details and SHA-256 checksums. On Apple Silicon, extract the ZIP
-and open `Prints Desktop.app`. The preview uses an ad-hoc signature and is
-unnotarised. Check the checksum before installing. See [Apple's Gatekeeper
-guidance](https://support.apple.com/en-au/102445) for the prompts macOS may
-show for a downloaded preview.
+## Pick a starting point
 
-Start at [prints.loftwah.com](https://prints.loftwah.com/) or visit the
-[App Composer showcase](https://composer.loftwah.com/prints-desktop).
+| If you want to… | Start here |
+| --- | --- |
+| **See what the UI does** | Open the [creative archive in your browser](https://prints.loftwah.com/#archive). In the desktop app, select **Higher Than Before**, choose **Compare formats**, and export an original. |
+| **Work offline** | Download the preview and import a JPEG, PNG or WebP from your computer. The offline library needs no account, wallet, token, or model credits. |
+| **Work with an agent** | Connect an approved client to your Oyster host’s `/mcp` endpoint with a Prints-scoped key. Start with the read-only `execute` example in the [Oyster guide](https://docs.fungi.computer/guides/call-an-app-from-your-own-server). |
+| **Use Shiitake** | Open Shiitake in your project folder and give it the release art brief below. For your first tool call, use your own authorised Fungi Team or Oyster connection. [Shiitake terminal guide](https://docs.fungi.computer/guides/use-the-terminal) |
+| **Build with AI** | Start with one brief and one target size. Create through web Prints, then inspect the resulting file in the desktop app. [Make an image with Prints](https://prints.loftwah.com/make) |
+| **Run the stack yourself** | Start with the free local Oyster trial. Add an authorised Workers AI model when you need generation and use AI Gateway when you need to observe supported requests. [Oyster trial](https://docs.fungi.computer/oyster-quickstart) · [Prints on Cloudflare](https://docs.fungi.computer/apps/prints) |
 
-## Build and inspect
+### Try a real brief
 
-Install Rust through [rustup](https://rustup.rs/). This checkout selects Rust
-1.99.1 and pins Rune and its platform patches in `Cargo.toml`. macOS requires
-the Xcode command-line tools.
+Use this in your agent or image tool. In the desktop app, **Prompt draft** is a local place to work on the text.
+
+```text
+Make a 4:5 release poster for an imaginary indie game called Night Shift.
+Show one orange desk lamp illuminating a tiny coastal town built from paper.
+Use warm orange, deep ink and off-white, with a single point of focus.
+Set only the words NIGHT SHIFT. Keep the letters readable at 300 pixels wide.
+Return one version. Keep the original image and save the prompt with it.
+```
+
+If you already have a scoped Oyster connection, this is a useful first agent request.
+
+```text
+Use the approved Oyster connection to list Prints outputs. Tell me which
+images are portrait and which are square, using the metadata already returned.
+Keep this read-only. Ask me to select an output before exporting anything.
+```
+
+The desktop app reads compatible Oyster libraries and hands creation off to signed-in web Prints. Hosted generation requires model access and funding. [Connection and permission details](docs/oyster.md) · [Native creation status](https://github.com/loftwah/prints-desktop/issues/6)
+
+## Get the preview
+
+Use the [release page](https://github.com/loftwah/prints-desktop/releases) for archives and SHA-256 checksums. This is the platform evidence for **v0.4.0**.
+
+| Platform | Run it | Verified |
+| --- | --- | --- |
+| **Apple Silicon Mac** · macOS 14+ | Extract the ZIP and open `Prints Desktop.app`. [Gatekeeper guidance](https://support.apple.com/en-au/102445) | Ran on an Apple Silicon Mac. The preview is ad-hoc signed and unnotarised. |
+| **Linux** · x64 or ARM64 | Extract the tarball and run `prints-desktop` in a graphical session. [Runtime prerequisites](CONTRIBUTING.md#platform-setup) | Both builds ran in virtual Debian X11 sessions. |
+| **Windows** · x64 | Extract the ZIP and run `prints-desktop.exe`. | Unsigned cross-build and archive checks passed. A Windows desktop launch is open. |
+
+[Release evidence](https://github.com/loftwah/prints-desktop/releases/tag/v0.4.0) · [Windows and Mac distribution status](https://github.com/loftwah/prints-desktop/issues/7) · [Public download counts](https://prints.loftwah.com/downloads)
+
+## Build or help
+
+Install [Rust with rustup](https://rustup.rs/), check the [platform setup](CONTRIBUTING.md#platform-setup), then run:
 
 ```sh
+git clone https://github.com/loftwah/prints-desktop.git
+cd prints-desktop
 cargo run --locked
-scripts/check-workspace.sh
-python3 scripts/check-connected-workspace.py
-python3 scripts/check-local-library.py
-cargo run --locked -- --snap prints.png --size 1360x840 --settle
-scripts/package-macos.sh
 ```
 
-To check the local library across a real restart without touching your own
-preferences, point Rune at an isolated directory for both launches:
+The app uses Rust and [Rune](https://github.com/anomalyco/rune), pinned in `Cargo.toml`. Prints runs independently. App Composer lists the project for discovery, with optional Composer integration reserved for a plugin.
 
-```sh
-dir=$(mktemp -d)
-RUNE_PREFS_DIR="$dir" cargo run --locked   # import an image, favourite it, quit
-RUNE_PREFS_DIR="$dir" cargo run --locked   # Local imports and its favourite return
-```
+**First contribution:** Try comparison or local import with a public image and tell us the exact point where you hesitate. Include your platform, release, and the steps you took. A reproducible observation or a small docs fix is useful on its own.
 
-The workspace replays require Bash and Python 3. They use in-memory preferences
-or an isolated test file. The connected replay uses a fictional loopback
-Oyster. Packaging on Apple Silicon writes the app under `dist/<version>/`
-and the ZIP and SHA-256 checksum to `dist/`. The bundle records its release
-version and Git revision in `Contents/Resources/build.txt`.
-
-## Platform builds
-
-- **Apple Silicon macOS** · `scripts/package-macos.sh` creates the app and archive.
-  It targets macOS 14 or later. The release notes identify the tested OS.
-  A public Developer ID build uses `PRINTS_CODESIGN_IDENTITY` and
-  `PRINTS_NOTARY_PROFILE` with an installed Developer ID Application
-  certificate and a preconfigured notary profile in Keychain. The packaging
-  script submits, staples and assesses that build before writing its archive.
-- **Linux ARM64 and x64** · Build with `cargo build --locked --release` using Rust 1.99.1.
-  On Debian, install `libdbus-1-dev`, `libxkbcommon-dev` and `libwayland-dev` to compile.
-  A graphical session needs the X11 or Wayland client libraries and working
-  graphics drivers. In a minimal Debian X11 session, provide `libx11-xcb1`,
-  `libxcursor1`, `libxi6` and `libxkbcommon-x11-0`. Native Open and Save use
-  the XDG desktop portal.
-  Run `scripts/package-portable.sh linux-arm64 target/release/prints-desktop`
-  for ARM64 or use `linux-x64` for x64. Portable archives include a desktop
-  entry and the Prints icon. For application-menu integration, install the
-  binary on your PATH, put the entry in `~/.local/share/applications`, and
-  put its PNG in `~/.local/share/icons/hicolor/512x512/apps`.
-- **Windows x64** · Build with Rust and the Visual Studio C++ build tools, or
-  use the GNU Rust target and MinGW-w64. To package a native GNU cross-build,
-  run `scripts/package-portable.sh windows-x64 target/x86_64-pc-windows-gnu/release/prints-desktop.exe`.
-  Consult the release notes for testing and signing status.
-
-## Hosted Prints
-
-From **Connect Prints**, enter your Oyster origin, Prints installation ID and
-named App key scoped to that installation. Browse indexed files, inspect media
-and prompt metadata, view supported image previews and export originals. Older compatible installations show the root library and expose creation and
-folder browsing through web Prints. Choose whether to keep the key in the
-system credential store. A working Secret
-Service is required to remember a connection on Linux.
-
-The connected preview opens the signed-in web Prints app for creation. Oyster
-identifies named App keys as Team keys and the supported Prints release declines
-generation from that actor type. Native generation requires a supported
-scoped member or agent sign-in.
-
-Oyster is Fungi's app platform. It runs Prints and authorises access to its
-library, model catalogue and selected Computer. Darkroom supplies provider
-adapters. A compatible installation and scoped credentials are required to
-browse owner assets. Generation may incur provider and Cloudflare charges.
-Exploring the offline workspace incurs no inference or Cloudflare usage.
-
-See Fungi's [Prints and Workers AI guide](https://docs.fungi.computer/apps/prints)
-for what it takes to set up your own backend. Upstream host, storage,
-Computer and inference costs depend on the configuration.
-
-The [read-only Oyster diagnostic](docs/oyster.md) documents the scoped connection,
-supported methods and verification steps for developers.
-
-Follow [the project issue](https://github.com/loftwah/app-composer/issues/1292)
-for delivery evidence and integration status. See [artwork provenance](assets/README.md)
-and [the licence](LICENSE).
+[Contribution guide](CONTRIBUTING.md) · [Open an issue](https://github.com/loftwah/prints-desktop/issues/new/choose) · [Product direction](PRODUCT.md) · [App Composer project](https://composer.loftwah.com/prints-desktop) · [MIT licence](LICENSE)
