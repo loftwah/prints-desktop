@@ -40,6 +40,7 @@ def output(computer="fictional-computer"):
 class OysterFixture(BaseHTTPRequestHandler):
     revoke = False
     legacy = False
+    transient = False
 
     def log_message(self, *_):
         pass
@@ -55,7 +56,9 @@ class OysterFixture(BaseHTTPRequestHandler):
         arguments = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         CALLS.append((operation, arguments))
         if operation == "listOutputs":
-            if self.legacy and "recursive" in arguments:
+            if "recursive" in arguments and (
+                self.legacy or (self.transient and len(CALLS) == 1)
+            ):
                 self.reply(502, {"error": "App execution failed"})
             elif self.revoke and arguments.get("folder") == "Studies":
                 self.reply(200, {"error": "revoked"})
@@ -64,7 +67,10 @@ class OysterFixture(BaseHTTPRequestHandler):
         elif operation == "listModels":
             self.reply(200, {"models": [{"id": "fictional-image-model", "label": "Fixture model", "kind": "image"}]})
         elif operation == "listFolders":
-            self.reply(200, {"folders": [{"name": "Studies", "folder": "Studies"}], "next": None})
+            if self.legacy:
+                self.reply(403, {"error": "not_declared"})
+            else:
+                self.reply(200, {"folders": [{"name": "Studies", "folder": "Studies"}], "next": None})
         elif operation == "getOutput":
             self.reply(200, output())
         elif operation == "openOutput":
@@ -96,9 +102,11 @@ def main():
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument("--revoked", action="store_true")
     modes.add_argument("--legacy", action="store_true")
+    modes.add_argument("--transient", action="store_true")
     options = parser.parse_args()
     OysterFixture.revoke = options.revoked
     OysterFixture.legacy = options.legacy
+    OysterFixture.transient = options.transient
     with tempfile.TemporaryDirectory(prefix="prints-connection-proof-") as temporary:
         run = Path(temporary)
         with ThreadingHTTPServer(("127.0.0.1", 0), OysterFixture) as server:
@@ -143,11 +151,13 @@ def main():
         assert (run / "export.jpg").read_bytes() == ASSET
         for expected in ("Prints library", "Fixture model", "Style", "Garden keeper", "Original exported"):
             assert expected in contents, expected
-        if options.legacy:
-            assert CALLS[:2] == [
+        if options.legacy or options.transient:
+            assert CALLS[:3] == [
                 ("listOutputs", {"recursive": True, "limit": 24}),
                 ("listOutputs", {"limit": 24}),
+                ("listFolders", {"limit": 1}),
             ]
+        if options.legacy:
             assert "This installation exposes its root library" in contents
             assert 'browse-folders' not in contents
         else:

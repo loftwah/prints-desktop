@@ -93,6 +93,22 @@ pub enum Error {
     Decode,
 }
 
+impl Error {
+    /// Distinguish lost connection authority from a denied individual method.
+    pub fn authority_lost(&self) -> bool {
+        let code = match self {
+            Self::Status { status: 401, .. } => return true,
+            Self::Status { code, .. } => code.as_deref(),
+            Self::Refused { code, .. } => Some(code.as_str()),
+            _ => None,
+        };
+        matches!(
+            code,
+            Some("revoked" | "stale_authority" | "grantor_lost_authority")
+        )
+    }
+}
+
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -234,14 +250,24 @@ impl OysterClient {
                 }
             ) || matches!(error, Error::Refused { code, .. } if code == "invalid_input"))
         {
-            // Older Prints rejects the recursive field before running the
-            // read. Confirm the legacy contract with a successful root page.
+            // Display the root page even if the recursive read is temporarily
+            // unavailable. Only a host that explicitly rejects the folder
+            // method confirms the older contract.
             if let Some(object) = input.as_object_mut() {
                 object.remove("recursive");
             }
             let page = serde_json::from_value(self.call("listOutputs", input)?)
                 .map_err(|_| Error::Decode)?;
-            self.root_only.store(true, Ordering::Relaxed);
+            match self.call("listFolders", json!({ "limit": 1 })) {
+                Err(Error::Status {
+                    status: 403,
+                    code: Some(code),
+                }) if code == "not_declared" => {
+                    self.root_only.store(true, Ordering::Relaxed);
+                }
+                Err(error) if error.authority_lost() => return Err(error),
+                _ => {}
+            }
             return Ok(page);
         }
         serde_json::from_value(result?).map_err(|_| Error::Decode)

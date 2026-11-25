@@ -224,7 +224,8 @@ impl Studio {
             })
             .collect();
         if self.prefs.set(local::LIBRARY_KEY, &originals).is_err() {
-            self.status = "The local library could not be saved to disk.".into();
+            self.status =
+                "The local library could not be saved. Changes apply for this session.".into();
             return false;
         }
         true
@@ -324,9 +325,6 @@ impl Studio {
             return Err("This library already holds 12 local images.");
         }
         let source = local::canonical(path).ok_or("This file could not be read.")?;
-        if source.to_str().is_none() {
-            return Err("This image's location can't be saved on this device.");
-        }
         if self.refs().contains(&source) {
             return Err("That image is already in your local library.");
         }
@@ -381,10 +379,6 @@ impl Studio {
                 return;
             }
         };
-        if source.to_str().is_none() {
-            self.status = "This image's location can't be saved on this device.".into();
-            return;
-        }
         let others: Vec<PathBuf> = self
             .assets
             .iter()

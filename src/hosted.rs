@@ -37,22 +37,9 @@ struct Failure {
     unauthorized: bool,
 }
 
-fn lost_authority(error: &Error) -> bool {
-    let reason = match error {
-        Error::Status { status: 401, .. } => return true,
-        Error::Status { code, .. } => code.as_deref(),
-        Error::Refused { code, .. } => Some(code.as_str()),
-        _ => None,
-    };
-    matches!(
-        reason,
-        Some("revoked" | "stale_authority" | "grantor_lost_authority")
-    )
-}
-
 impl From<Error> for Failure {
     fn from(error: Error) -> Self {
-        let unauthorized = lost_authority(&error);
+        let unauthorized = error.authority_lost();
         let message = match &error {
             Error::Status { status: 401, .. } => {
                 "The key was refused or revoked. Check your scoped App key.".into()
@@ -193,7 +180,7 @@ impl Hosted {
                 let page = client.list_outputs(None, true, None, 24)?;
                 let models = client.list_models().map(|catalogue| catalogue.models);
                 let models = match models {
-                    Err(error) if lost_authority(&error) => return Err(error.into()),
+                    Err(error) if error.authority_lost() => return Err(error.into()),
                     other => other,
                 };
                 let stored = if remember && saved_profile.as_ref().is_some_and(|old| old != &client.identity()) {
