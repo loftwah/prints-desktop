@@ -12,6 +12,7 @@ import sys
 
 scratch = Path(sys.argv[1])
 steps = [
+    (0.1, "tap", {"key": "afterlight"}),
     (0.2, "tap", {"key": "print-2"}),
     (0.4, "tap", {"key": "favourite"}),
     (0.7, "tap", {"key": "favourites"}),
@@ -30,7 +31,7 @@ steps = [
     {"t": t, "type": kind, **event} for t, kind, event in steps
 ]))
 PY
-binary=target/debug/prints-desktop
+binary="${CARGO_TARGET_DIR:-target}/debug/prints-desktop"
 if [ -f "$binary.exe" ]; then binary="$binary.exe"; fi
 "$binary" --script "$scratch/steps.json" --tree "$scratch/tree.json" --at 3.8 --size 1010x690 --settle
 cmp assets/salt.jpg "$scratch/export.jpg"

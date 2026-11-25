@@ -6,8 +6,11 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+mod archive;
+mod comparison;
 mod hosted;
 mod local;
+mod navigation;
 
 use rune::prefs::Prefs;
 use rune::tok::TextStyle;
@@ -74,6 +77,7 @@ const AFTERLIGHT: [Study; 6] = [
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Shelf {
+    Archive,
     Samples,
     Favourites,
     Imports,
@@ -83,6 +87,7 @@ enum Shelf {
 enum Screen {
     Workspace,
     Preview,
+    Compare,
     Draft,
     Connection,
     Hosted,
@@ -94,10 +99,40 @@ struct Print {
     bytes: Arc<[u8]>,
     image: Image,
     study: Option<usize>,
+    edition: Option<&'static archive::Edition>,
     // Canonical path to the user's original, never a copy kept by the app.
     source: Option<PathBuf>,
     // A saved original may be missing for a while; keep the reference so it can return.
     available: bool,
+}
+
+/// Case-insensitive multiword search over a print's title and filename, plus the
+/// bundled note and prompt when it is an Afterlight study.
+fn matches_search(asset: &Print, query: &str) -> bool {
+    let mut fields = vec![asset.title.as_str(), asset.filename.as_str()];
+    if let Some(study) = asset.study {
+        fields.push(AFTERLIGHT[study].note);
+        fields.push(AFTERLIGHT[study].prompt);
+    }
+    if let Some(edition) = asset.edition {
+        fields.push(edition.note);
+        fields.push(edition.source);
+    }
+    matches_terms(&fields, query)
+}
+
+/// Every word must appear somewhere in the fields, in any order and casing.
+fn matches_terms(fields: &[&str], query: &str) -> bool {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return true;
+    }
+    let haystack = fields
+        .iter()
+        .map(|field| field.to_lowercase())
+        .collect::<Vec<_>>()
+        .join("\n");
+    query.split_whitespace().all(|term| haystack.contains(term))
 }
 
 struct Studio {
@@ -110,6 +145,7 @@ struct Studio {
     inspector: bool,
     draft: TextEdit,
     draft_dirty: bool,
+    search: TextEdit,
     status: String,
     prefs: Prefs,
     cache: Option<ImageCache>,
@@ -133,19 +169,34 @@ impl Studio {
         favourites.retain(|&i| i < AFTERLIGHT.len());
         favourites.sort_unstable();
         favourites.dedup();
+        let archive_favourites = prefs
+            .get::<Vec<String>>("archive-favourites")
+            .unwrap_or_default();
+        favourites.extend(
+            archive::EDITIONS
+                .iter()
+                .enumerate()
+                .filter_map(|(i, edition)| {
+                    archive_favourites
+                        .iter()
+                        .any(|name| name == edition.filename)
+                        .then_some(AFTERLIGHT.len() + i)
+                }),
+        );
         let theme_light = prefs.get("light").unwrap_or(false);
         let draft = TextEdit::new(prefs.get::<String>("draft").unwrap_or_default());
         let hosted = hosted::Hosted::new(&prefs);
         Self {
-            shelf: Shelf::Samples,
+            shelf: Shelf::Archive,
             screen: Screen::Workspace,
             assets: Vec::new(),
-            selected: Some(0),
+            selected: Some(AFTERLIGHT.len()),
             favourites,
             theme_light,
             inspector: true,
             draft,
             draft_dirty: false,
+            search: TextEdit::default(),
             status: String::new(),
             prefs,
             cache: None,
@@ -170,11 +221,25 @@ impl Studio {
                     bytes,
                     image,
                     study: Some(index),
+                    edition: None,
                     source: None,
                     available: true,
                 }
             })
             .collect();
+        self.assets.extend(archive::EDITIONS.iter().map(|edition| {
+            let bytes: Arc<[u8]> = edition.bytes.into();
+            Print {
+                title: edition.title.into(),
+                filename: edition.filename.into(),
+                image: cache.load(bytes.clone()),
+                bytes,
+                study: None,
+                edition: Some(edition),
+                source: None,
+                available: true,
+            }
+        }));
         if self.proof {
             for asset in &self.assets {
                 let _ = asset.image.wait();
@@ -236,27 +301,56 @@ impl Studio {
             .iter()
             .enumerate()
             .filter_map(|(i, item)| {
-                let visible = match self.shelf {
+                let on_shelf = match self.shelf {
+                    Shelf::Archive => item.edition.is_some(),
                     Shelf::Samples => item.study.is_some(),
                     Shelf::Favourites => self.favourites.contains(&i),
-                    Shelf::Imports => item.study.is_none(),
+                    Shelf::Imports => item.source.is_some(),
                 };
-                visible.then_some(i)
+                (on_shelf && matches_search(item, &self.search.text)).then_some(i)
             })
             .collect()
     }
 
+    fn searching(&self) -> bool {
+        !self.search.text.trim().is_empty()
+    }
+
+    /// Keep a valid selection for what the shelf and the find field currently show.
+    fn sync_selection(&mut self) {
+        let visible = self.visible();
+        if self.selected.is_none_or(|i| !visible.contains(&i)) {
+            self.selected = visible.first().copied();
+        }
+    }
+
+    fn search_changed(&mut self, tx: &mut Tx) {
+        self.sync_selection();
+        self.status.clear();
+        self.reveal_selection(tx);
+    }
+
+    fn focus_search(&mut self, tx: &mut Tx) {
+        self.screen = Screen::Workspace;
+        self.search.set_selection(0, self.search.text.len());
+        tx.focus("search-input", true);
+    }
+
+    fn clear_search(&mut self) {
+        self.search.clear();
+        self.sync_selection();
+        self.status.clear();
+    }
+
     fn show_shelf(&mut self, shelf: Shelf) {
-        if shelf != Shelf::Samples {
+        if matches!(shelf, Shelf::Imports | Shelf::Favourites) {
             self.open_local_library();
         }
         self.shelf = shelf;
         self.screen = Screen::Workspace;
         self.status.clear();
-        let visible = self.visible();
-        if !self.selected.is_some_and(|i| visible.contains(&i)) {
-            self.selected = visible.first().copied();
-        }
+        self.search.clear();
+        self.sync_selection();
     }
 
     fn reveal_selection(&self, tx: &mut Tx) {
@@ -294,6 +388,21 @@ impl Studio {
                 .filter(|&i| i < AFTERLIGHT.len())
                 .collect();
             self.status = if self.prefs.set("favourites", &samples).is_ok() {
+                String::new()
+            } else {
+                "Favourites could not be saved to disk.".into()
+            };
+        } else if self.assets[i].edition.is_some() {
+            let archive_favourites: Vec<&str> = self
+                .favourites
+                .iter()
+                .filter_map(|&i| self.assets[i].edition.map(|edition| edition.filename))
+                .collect();
+            self.status = if self
+                .prefs
+                .set("archive-favourites", &archive_favourites)
+                .is_ok()
+            {
                 String::new()
             } else {
                 "Favourites could not be saved to disk.".into()
@@ -342,7 +451,7 @@ impl Studio {
         if self
             .assets
             .get(index)
-            .is_none_or(|asset| asset.study.is_some())
+            .is_none_or(|asset| asset.source.is_none())
         {
             return;
         }
@@ -411,7 +520,7 @@ impl Studio {
         if self
             .assets
             .get(index)
-            .is_none_or(|asset| asset.study.is_some() || asset.source.is_none())
+            .is_none_or(|asset| asset.source.is_none())
         {
             return;
         }
@@ -535,6 +644,7 @@ fn load_original(path: &Path, cache: &ImageCache) -> Result<Print, OriginalError
         bytes,
         image,
         study: None,
+        edition: None,
         source: Some(path.to_path_buf()),
         available: true,
     })
@@ -554,6 +664,7 @@ fn unavailable_print(path: &Path, cache: &ImageCache) -> Print {
         bytes,
         image,
         study: None,
+        edition: None,
         source: Some(path.to_path_buf()),
         available: false,
     }
@@ -820,7 +931,14 @@ fn rail(s: &Studio, p: Ink) -> El {
         .fill(p.rail)
         .border_sides([0.0, 1.0, 0.0, 0.0], p.line)
         .child(heading)
-        .child(el().h(26.0))
+        .child(el().h(18.0))
+        .child(nav(
+            "creative-archive",
+            "Creative Archive",
+            s.shelf == Shelf::Archive && s.screen == Screen::Workspace,
+            p,
+            |s, _| s.show_shelf(Shelf::Archive),
+        ))
         .child(nav(
             "afterlight",
             "Afterlight",
@@ -925,7 +1043,9 @@ fn inspector(s: &Studio, asset: &Print, p: Ink) -> El {
         .gap(10.0)
         .child(label("Image details", 12.0, 650.0, p.muted))
         .child(label(&asset.title, 23.0, 640.0, p.primary).wrap());
-    let source = if asset.study.is_some() {
+    let source = if let Some(edition) = asset.edition {
+        edition.source
+    } else if asset.study.is_some() {
         "Afterlight · Sample artwork"
     } else if asset.available {
         "Local import · Linked original"
@@ -944,6 +1064,22 @@ fn inspector(s: &Studio, asset: &Print, p: Ink) -> El {
                 action("use-prompt", "Use in draft", p, false, |s, _| {
                     s.use_prompt()
                 })
+                .w_full(),
+            );
+    }
+    if let Some(edition) = asset.edition {
+        details = details
+            .child(label(edition.note, 13.0, 450.0, p.muted).wrap())
+            .child(
+                action(
+                    "published-work",
+                    "View published work",
+                    p,
+                    false,
+                    move |_, tx| {
+                        let _ = tx.open_url(edition.url);
+                    },
+                )
                 .w_full(),
             );
     }
@@ -980,7 +1116,7 @@ fn inspector(s: &Studio, asset: &Print, p: Ink) -> El {
     if asset.available {
         actions = actions.child(action("export", "Export original", p, true, export));
     }
-    if asset.study.is_none() {
+    if asset.source.is_some() {
         if !asset.available {
             actions = actions
                 .child(action(
@@ -1011,7 +1147,12 @@ fn inspector(s: &Studio, asset: &Print, p: Ink) -> El {
 
 fn workspace(s: &Studio, p: Ink) -> El {
     let selection = s.selected.and_then(|i| s.assets.get(i));
+    let visible = s.visible();
     let (title, subtitle) = match s.shelf {
+        Shelf::Archive => (
+            "Loftwah Creative Archive",
+            "Published work from LoftwahFM, Fighter and Bubbles.",
+        ),
         Shelf::Samples => ("Afterlight", "Six studies in the light that lingers."),
         Shelf::Favourites => ("Favourites", "The prints you want to return to."),
         Shelf::Imports => (
@@ -1025,11 +1166,57 @@ fn workspace(s: &Studio, p: Ink) -> El {
         .child(
             col()
                 .grow(1.0)
+                .shrink()
+                .min_w(0.0)
                 .gap(4.0)
-                .child(label(title, 36.0, 650.0, p.primary))
+                .child(label(title, 31.0, 650.0, p.primary).wrap())
                 .child(label(subtitle, 14.0, 450.0, p.muted).wrap()),
         )
         .child(action("import", "Import", p, false, file_open));
+    let summary = if s.searching() {
+        format!(
+            "{} {} found",
+            visible.len(),
+            if visible.len() == 1 {
+                "print"
+            } else {
+                "prints"
+            }
+        )
+    } else {
+        String::new()
+    };
+    let find = row()
+        .w_full()
+        .items_center()
+        .gap(8.0)
+        .child(label("Find", 11.0, 650.0, p.muted))
+        .child(
+            text_input(&s.search, TextStyle::new(13.0, 450.0))
+                .key("search-input")
+                .label("Find in this shelf")
+                .single_line()
+                .w(240.0)
+                .h(36.0)
+                .px(12.0)
+                .py(9.0)
+                .radius(7.0)
+                .fill(p.field)
+                .focus_ring(2.0, 2.0, p.accent)
+                .color(p.primary)
+                .placeholder("Title, note or filename", p.muted)
+                .on_edit(|s: &mut Studio| &mut s.search)
+                .on_input_key(|s: &mut Studio, event: &KeyEvent, tx: &mut Tx| {
+                    if event.key != Key::Escape {
+                        return false;
+                    }
+                    s.clear_search();
+                    tx.blur();
+                    true
+                })
+                .on_input_change(|s: &mut Studio, tx: &mut Tx| s.search_changed(tx)),
+        )
+        .child(label(summary, 11.0, 500.0, p.muted).grow(1.0).truncate());
     let body = col()
         .key("gallery")
         .w_full()
@@ -1038,18 +1225,28 @@ fn workspace(s: &Studio, p: Ink) -> El {
         .shrink()
         .padding(18.0)
         .gap(13.0)
-        .child(header);
+        .child(header)
+        .child(find);
     let Some(asset) = selection else {
-        let message = if s.status.is_empty() {
-            match s.shelf {
-                Shelf::Favourites => {
-                    "Add a favourite in Afterlight or Local imports to find it here."
+        let message: String = if s.status.is_empty() {
+            if s.searching() {
+                format!(
+                    "No prints in {} match “{}”. Clear the find field to see the shelf.",
+                    title,
+                    s.search.text.trim()
+                )
+            } else {
+                match s.shelf {
+                    Shelf::Favourites => {
+                        "Add a favourite from a collection or local import to find it here.".into()
+                    }
+                    Shelf::Imports => "Drop a JPEG, PNG or WebP here, or choose Import.".into(),
+                    Shelf::Samples => "Loading Afterlight…".into(),
+                    Shelf::Archive => "Opening the Creative Archive…".into(),
                 }
-                Shelf::Imports => "Drop a JPEG, PNG or WebP here, or choose Import.",
-                Shelf::Samples => "Loading Afterlight…",
             }
         } else {
-            &s.status
+            s.status.clone()
         };
         return body.child(
             el().grow(1.0)
@@ -1077,14 +1274,17 @@ fn workspace(s: &Studio, p: Ink) -> El {
     let mut caption = row().gap(8.0).items_center().child(
         col()
             .grow(1.0)
+            .shrink()
+            .min_w(0.0)
             .gap(3.0)
             .child(label(&asset.title, 19.0, 620.0, p.primary).truncate())
             .child(
                 label(
-                    match asset.study {
-                        Some(i) => AFTERLIGHT[i].note,
-                        None if asset.available => "Linked original on this device.",
-                        None => "Original unavailable — refresh or locate it.",
+                    match (asset.study, asset.edition) {
+                        (Some(i), _) => AFTERLIGHT[i].note,
+                        (_, Some(edition)) => edition.source,
+                        _ if asset.available => "Linked original on this device.",
+                        _ => "Original unavailable — refresh or locate it.",
                     },
                     12.0,
                     450.0,
@@ -1093,6 +1293,17 @@ fn workspace(s: &Studio, p: Ink) -> El {
                 .truncate(),
             ),
     );
+    if comparison::applies(s) {
+        caption = caption.child(action(
+            "compare-editions",
+            "Compare formats",
+            p,
+            false,
+            |s, _| {
+                s.screen = Screen::Compare;
+            },
+        ));
+    }
     caption = caption
         .child(action("preview", "Full view", p, false, |s, _| {
             s.screen = Screen::Preview
@@ -1108,7 +1319,6 @@ fn workspace(s: &Studio, p: Ink) -> El {
             false,
             |s, _| s.inspector = !s.inspector,
         ));
-    let visible = s.visible();
     let mut strip = row().key("contact-sheet").w_full().gap(7.0);
     for &i in &visible {
         let tile = &s.assets[i];
@@ -1318,6 +1528,9 @@ fn view(s: &Studio, _: &mut Cx<Studio>) -> El {
     if s.screen == Screen::Preview {
         return shell.child(fullscreen(s, p));
     }
+    if s.screen == Screen::Compare {
+        return shell.child(comparison::view(s, p));
+    }
     shell = shell.child(rail(s, p));
     match s.screen {
         Screen::Workspace => {
@@ -1331,7 +1544,7 @@ fn view(s: &Studio, _: &mut Cx<Studio>) -> El {
         Screen::Draft => shell = shell.child(drafting(s, p)),
         Screen::Connection => shell = shell.child(hosted::connection(s, p)),
         Screen::Hosted => shell = shell.child(hosted::library(s, p)),
-        Screen::Preview => unreachable!(),
+        Screen::Preview | Screen::Compare => unreachable!(),
     }
     shell.on_drop_files(|s: &mut Studio, paths, tx| {
         if s.screen == Screen::Workspace
@@ -1347,9 +1560,19 @@ fn view(s: &Studio, _: &mut Cx<Studio>) -> El {
 
 fn keyboard(s: &mut Studio, event: &KeyEvent, tx: &mut Tx) -> bool {
     match event.key {
+        Key::Escape
+            if s.screen == Screen::Workspace
+                && (tx.focused() == Some("search-input") || s.searching()) =>
+        {
+            s.clear_search();
+            tx.blur();
+        }
         Key::Escape if s.screen != Screen::Workspace => {
             s.screen = Screen::Workspace;
             tx.blur();
+        }
+        Key::Command('f') if matches!(s.screen, Screen::Workspace | Screen::Preview) => {
+            s.focus_search(tx);
         }
         Key::Command('o') => file_open(s, tx),
         Key::Command('s') if s.screen == Screen::Draft => s.save_draft(),
@@ -1374,7 +1597,8 @@ fn keyboard(s: &mut Studio, event: &KeyEvent, tx: &mut Tx) -> bool {
 
 fn main() {
     rune::set_app_id(APP_ID);
-    App::new(AppSpec {
+    let _ = rune::set_app_icon(include_bytes!("../assets/icon.png").to_vec());
+    let app = App::new(AppSpec {
         min_size: Some((940.0, 660.0)),
         setup: Some(Studio::load),
         poll: Some(hosted::poll),
@@ -1385,6 +1609,35 @@ fn main() {
     .chrome(rune::Chrome {
         full_size_content: false,
         ..Default::default()
-    })
-    .run();
+    });
+    navigation::items()
+        .into_iter()
+        .fold(app, App::menu_item)
+        .run();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::matches_terms;
+
+    #[test]
+    fn search_ignores_case_and_matches_every_word_across_fields() {
+        let fields = [
+            "Relay Station",
+            "An antenna tower holds its ground.",
+            "relay-station.jpg",
+        ];
+        assert!(matches_terms(&fields, "RELAY station"));
+        assert!(matches_terms(&fields, "tower relay"));
+        assert!(matches_terms(&fields, "  station   jpg "));
+    }
+
+    #[test]
+    fn search_requires_all_words_and_an_empty_query_matches_everything() {
+        let fields = ["Salt Memory", "Fractured pink salt.", "salt-memory.jpg"];
+        assert!(matches_terms(&fields, ""));
+        assert!(matches_terms(&fields, "   "));
+        assert!(!matches_terms(&fields, "salt harbour"));
+        assert!(!matches_terms(&fields, "relay"));
+    }
 }

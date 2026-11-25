@@ -1,9 +1,11 @@
 # Prints Desktop design
 
-Afterlight is the opening collection. A full-width print is the largest
-element in the workspace. Its contact sheet stays visible below the frame,
+The Loftwah Creative Archive opens on the cover of Higher Than Before.
+A full-width print is the largest element in the workspace. Afterlight
+retains its own shelf. Its contact sheet stays visible below the frame,
 with the selected image outlined in warm orange. The inspector carries the
-dimensions, source and creative brief of the same image. A single filled
+dimensions and provenance of the same image. The campaign comparison shows
+the album cover and poster at their original proportions. A single filled
 action marks original-file export.
 
 The dark workspace uses charcoal violet, with slightly lighter sides for
@@ -16,7 +18,7 @@ navigation and export.
 No ambient motion. Keyboard navigation shares the same selection state as
 mouse and touchpad input. Native file dialogs leave the gallery visible.
 The gallery takes the remaining width while the
-inspector can be hidden. Samples are available at first launch.
+inspector can be hidden. Both offline collections are available at first launch.
 
 See the [artwork credit](assets/README.md) and the
 [workspace direction](docs/native-workspace.md).

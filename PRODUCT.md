@@ -2,8 +2,9 @@
 
 Prints Desktop is an independent native creative workspace for existing Prints
 users and people curious about creating and keeping their own media. Its first
-launch opens an offline collection so people can inspect, shortlist, and export
-artwork before connecting any service.
+launch opens the offline Loftwah Creative Archive so people can inspect,
+shortlist and export published portfolio work before connecting any service.
+Afterlight remains a separate offline collection.
 
 ## Platform and stack
 

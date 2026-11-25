@@ -41,6 +41,11 @@ trap 'rm -rf "$stage"' EXIT
 mkdir -p "$stage/$name/licenses" dist
 install -m 755 "$binary" "$stage/$name/$executable"
 install -m 644 LICENSE README.md "$stage/$name/"
+install -m 644 assets/archive/README.md "$stage/$name/Creative-Archive.md"
+if [[ "$platform" == linux-* ]]; then
+  install -m 644 assets/icon.png "$stage/$name/com.loftwah.prints-desktop.png"
+  install -m 644 assets/com.loftwah.prints-desktop.desktop "$stage/$name/"
+fi
 install -m 644 licenses/*.txt "$stage/$name/licenses/"
 printf 'version=%s\nsource=%s\nplatform=%s\n' "$version" "$revision" "$platform" > "$stage/$name/build.txt"
 

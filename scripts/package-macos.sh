@@ -38,8 +38,9 @@ test ! -e "$destination" || {
 
 MACOSX_DEPLOYMENT_TARGET="$minimum_os" cargo build --locked --release
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
-install -m 755 target/release/prints-desktop "$app/Contents/MacOS/prints-desktop"
+install -m 755 "${CARGO_TARGET_DIR:-target}/release/prints-desktop" "$app/Contents/MacOS/prints-desktop"
 install -m 644 LICENSE "$app/Contents/Resources/LICENSE"
+install -m 644 assets/archive/README.md "$app/Contents/Resources/Creative-Archive.md"
 mkdir -p "$app/Contents/Resources/licenses"
 install -m 644 licenses/*.txt "$app/Contents/Resources/licenses/"
 
