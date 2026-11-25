@@ -45,6 +45,7 @@ class OysterFixture(BaseHTTPRequestHandler):
     transient = False
     folder_error = False
     keep_local = False
+    library_unavailable = False
 
     def log_message(self, *_):
         pass
@@ -60,7 +61,9 @@ class OysterFixture(BaseHTTPRequestHandler):
         arguments = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         CALLS.append((operation, arguments))
         if operation == "listOutputs":
-            if "recursive" in arguments and (
+            if self.library_unavailable:
+                self.reply(200, {"error": "library_unavailable", "message": "Untrusted fixture text"})
+            elif "recursive" in arguments and (
                 self.legacy or (self.transient and len(CALLS) == 1)
             ):
                 self.reply(502, {"error": "App execution failed"})
@@ -121,12 +124,14 @@ def main():
     modes.add_argument("--transient", action="store_true")
     modes.add_argument("--folder-error", action="store_true")
     modes.add_argument("--keep-local", action="store_true")
+    modes.add_argument("--library-unavailable", action="store_true")
     options = parser.parse_args()
     OysterFixture.revoke = options.revoked
     OysterFixture.legacy = options.legacy
     OysterFixture.transient = options.transient
     OysterFixture.folder_error = options.folder_error
     OysterFixture.keep_local = options.keep_local
+    OysterFixture.library_unavailable = options.library_unavailable
     with tempfile.TemporaryDirectory(prefix="prints-connection-proof-") as temporary:
         run = Path(temporary)
         with ThreadingHTTPServer(("127.0.0.1", 0), OysterFixture) as server:
@@ -148,6 +153,8 @@ def main():
             ]
             if options.revoked or options.folder_error:
                 actions = [entry for entry in actions if entry[0] <= 3.90]
+            elif options.library_unavailable:
+                actions = [entry for entry in actions if entry[0] <= 2.75]
             elif options.keep_local:
                 actions = [entry for entry in actions if entry[0] <= 2.75]
                 actions.append((3.0, "tap", {"key": "afterlight"}))
@@ -156,7 +163,9 @@ def main():
             steps = run / "steps.json"
             steps.write_text(json.dumps([{"t": t, "type": kind, **options} for t, kind, options in actions]))
             tree = run / "tree.json"
-            finish = "4.6" if (options.revoked or options.folder_error or options.keep_local) else "6.45"
+            finish = "4.6" if (
+                options.revoked or options.folder_error or options.keep_local or options.library_unavailable
+            ) else "6.45"
             args = [str(BINARY), "--script", str(steps), "--tree", str(tree), "--at", finish,
                     "--size", "1100x740", "--settle", "--realtime"]
             if options.snapshot:
@@ -167,6 +176,15 @@ def main():
         contents = tree.read_text()
         nodes = json.loads(contents)
         assert KEY not in contents
+        if options.library_unavailable:
+            assert "Choose a gallery folder in web Prints" in contents
+            assert "selected Oyster Computer" in contents
+            assert "Untrusted fixture text" not in contents
+            assert has_key(nodes, "connect-hosted")
+            assert has_key(nodes, "setup-guide")
+            assert CALLS == [("listOutputs", {"recursive": True, "limit": 24})]
+            print("First-run replay passed. Missing gallery shows recovery steps and allows reconnect.")
+            return
         if options.revoked:
             assert "Prints refused listOutputs: revoked" in contents
             assert not has_key(nodes, "hosted-item-0")

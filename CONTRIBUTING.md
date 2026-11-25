@@ -29,6 +29,7 @@ Use the smallest check that exercises the affected behaviour. Rust’s unit chec
 | Archive selection, Find, or comparison | `python3 scripts/check-archive.py` |
 | Workspace navigation and Afterlight | `scripts/check-workspace.sh` |
 | Local originals and saved links | `python3 scripts/check-local-library.py` |
+| Saved prompt and shortlisted originals | `python3 scripts/check-draft-project.py` |
 | Oyster connection and library | `python3 scripts/check-connected-workspace.py` |
 
 The scripted checks use Bash or Python 3 and isolate preferences. The connected replay uses fictional loopback data. For a view change, capture the actual result through Rune:

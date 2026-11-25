@@ -10,8 +10,10 @@ mod archive;
 mod comparison;
 mod disk;
 use disk::OriginalWrite;
+mod draft;
 mod hosted;
 mod local;
+mod local_images;
 mod navigation;
 
 use rune::prefs::Prefs;
@@ -23,6 +25,7 @@ use rune::{
 
 const APP_ID: &str = "com.loftwah.prints-desktop";
 const MAX_IMPORT: u64 = 24 * 1024 * 1024;
+const CONTACT_PAGE_SIZE: usize = 12;
 
 struct Study {
     title: &'static str,
@@ -112,10 +115,7 @@ impl Picture {
 enum Original {
     Afterlight(&'static Study, Picture),
     Edition(&'static archive::Edition, Picture),
-    Linked {
-        path: PathBuf,
-        picture: Option<Picture>,
-    },
+    Linked { path: PathBuf, available: bool },
 }
 
 struct Print {
@@ -142,6 +142,25 @@ impl Print {
         }
     }
 
+    fn linked(path: PathBuf, filename: Option<String>) -> Self {
+        let title = path.file_stem().map_or_else(
+            || "Saved local image".into(),
+            |stem| stem.to_string_lossy().into_owned(),
+        );
+        let filename = filename.unwrap_or_else(|| {
+            path.file_name()
+                .map_or_else(|| title.clone(), |name| name.to_string_lossy().into_owned())
+        });
+        Self::new(
+            title,
+            filename,
+            Original::Linked {
+                path,
+                available: true,
+            },
+        )
+    }
+
     fn study(&self) -> Option<&'static Study> {
         match self.original {
             Original::Afterlight(study, _) => Some(study),
@@ -166,8 +185,18 @@ impl Print {
     fn picture(&self) -> Option<&Picture> {
         match &self.original {
             Original::Afterlight(_, picture) | Original::Edition(_, picture) => Some(picture),
-            Original::Linked { picture, .. } => picture.as_ref(),
+            Original::Linked { .. } => None,
         }
+    }
+
+    fn available(&self) -> bool {
+        !matches!(
+            self.original,
+            Original::Linked {
+                available: false,
+                ..
+            }
+        )
     }
 
     fn caption(&self) -> &'static str {
@@ -175,11 +204,11 @@ impl Print {
             Original::Afterlight(study, _) => study.note,
             Original::Edition(edition, _) => edition.source,
             Original::Linked {
-                picture: Some(_), ..
+                available: true, ..
             } => "Linked original on this device.",
-            Original::Linked { picture: None, .. } => {
-                "Original unavailable — refresh or locate it."
-            }
+            Original::Linked {
+                available: false, ..
+            } => "Original unavailable — refresh or locate it.",
         }
     }
 }
@@ -229,10 +258,12 @@ struct Studio {
     inspector: bool,
     draft: TextEdit,
     draft_dirty: bool,
+    draft_shortlist: Vec<usize>,
     search: Search,
     status: String,
     prefs: Prefs,
-    cache: Option<ImageCache>,
+    cache: Option<Arc<ImageCache>>,
+    local_images: local_images::LocalImages,
     import_request: Latest<ImportBatch>,
     import_origin: Option<(Screen, Shelf)>,
     local_export: LocalExport,
@@ -285,10 +316,12 @@ impl Studio {
             inspector: true,
             draft,
             draft_dirty: false,
+            draft_shortlist: Vec::new(),
             search: Search::default(),
             status: String::new(),
             prefs,
             cache: None,
+            local_images: local_images::LocalImages::default(),
             import_request: Latest::default(),
             import_origin: None,
             local_export: LocalExport::Idle,
@@ -302,8 +335,9 @@ impl Studio {
     fn load(&mut self, wake: Waker) {
         self.hosted.set_waker(wake.clone());
         self.import_request.set_waker(wake.clone());
+        self.local_images.set_waker(wake.clone());
         self.wake = Some(wake.clone());
-        let cache = ImageCache::new(wake);
+        let cache = Arc::new(ImageCache::new(wake));
         self.assets = AFTERLIGHT
             .iter()
             .map(|study| {
@@ -321,6 +355,7 @@ impl Studio {
                 Original::Edition(edition, Picture::new(edition.bytes.into(), &cache)),
             )
         }));
+        draft::restore_bundled(self);
         if self.proof {
             for picture in self.assets.iter().filter_map(Print::picture) {
                 let _ = picture.image.wait();
@@ -333,23 +368,73 @@ impl Studio {
         if self.local_loaded {
             return;
         }
-        let Some(cache) = &self.cache else {
-            return;
-        };
         self.local_loaded = true;
         for record in local::read(self.prefs.get(local::LIBRARY_KEY)) {
             if record.favourite {
                 self.favourites.push(self.assets.len());
             }
-            let print = load_original(&record.path, cache)
-                .unwrap_or_else(|_| unavailable_print(&record.path));
-            if self.proof
-                && let Some(picture) = print.picture()
-            {
-                let _ = picture.image.wait();
+            if record.in_draft {
+                self.draft_shortlist.push(self.assets.len());
             }
-            self.assets.push(print);
+            self.assets.push(Print::linked(record.path, None));
         }
+    }
+
+    fn original<'a>(&'a self, asset: &'a Print) -> Option<&'a Picture> {
+        asset.picture().or_else(|| {
+            self.local_images
+                .original(asset.path()?)
+                .map(|image| &image.picture)
+        })
+    }
+
+    fn poll_local_images(&mut self) -> bool {
+        let Some(cache) = &self.cache else {
+            return false;
+        };
+        let originals = match self.screen {
+            Screen::Workspace | Screen::Preview => [self.selected, None],
+            Screen::Compare(comparison::Pair::Local(first, second)) => [Some(second), Some(first)],
+            _ => [None; 2],
+        };
+        let path_at = |index| {
+            self.assets
+                .get(index)
+                .and_then(Print::path)
+                .map(Path::to_path_buf)
+        };
+        let originals: Vec<_> = originals
+            .into_iter()
+            .flatten()
+            .filter_map(path_at)
+            .collect();
+        let mut thumbnails = Vec::new();
+        if self.screen == Screen::Workspace {
+            let visible = self.visible();
+            thumbnails.extend(
+                visible[contact_page(&visible, self.selected)]
+                    .iter()
+                    .copied()
+                    .filter_map(path_at),
+            );
+        }
+        let ready = self.local_images.poll(&originals, &thumbnails, cache);
+        let changed = ready.iter().any(Option::is_some);
+        for path in ready.into_iter().flatten() {
+            let Some(asset) = self
+                .assets
+                .iter_mut()
+                .find(|item| item.path() == Some(path.as_path()))
+            else {
+                continue;
+            };
+            if let Original::Linked { available, .. } = &mut asset.original
+                && let Some(loaded) = self.local_images.available(&path)
+            {
+                *available = loaded;
+            }
+        }
+        changed
     }
 
     fn refs(&self) -> impl Iterator<Item = &Path> {
@@ -365,6 +450,7 @@ impl Studio {
                 Some(local::Reference {
                     path: asset.path()?.to_path_buf(),
                     favourite: self.favourites.contains(&index),
+                    in_draft: self.draft_shortlist.contains(&index),
                 })
             })
             .collect();
@@ -455,6 +541,21 @@ impl Studio {
         self.status.clear();
     }
 
+    fn turn_contact_page(&mut self, forward: bool, tx: &mut Tx) {
+        let visible = self.visible();
+        let current = contact_page(&visible, self.selected);
+        let position = if forward {
+            current.end
+        } else {
+            current.start.saturating_sub(CONTACT_PAGE_SIZE)
+        };
+        if let Some(&index) = visible.get(position) {
+            self.selected = Some(index);
+            self.status.clear();
+            tx.scroll_to_instant("contact-sheet", 0.0, 0.0);
+        }
+    }
+
     fn favourite(&mut self) {
         let Some(i) = self.selected else { return };
         if self.favourites.contains(&i) {
@@ -534,14 +635,11 @@ impl Studio {
             return false;
         };
         let origin = self.import_origin.take();
-        let Some(cache) = &self.cache else {
-            return false;
-        };
         let start = self.assets.len();
         for (path, original) in batch.images {
             // A linked image can be relocated while the batch is being read.
             if !self.refs().any(|existing| existing == path) {
-                self.assets.push(original.link(path, cache));
+                self.assets.push(Print::linked(path, Some(original)));
             }
         }
         let linked = self.assets.len() - start;
@@ -576,19 +674,17 @@ impl Studio {
     }
 
     /// Re-read the stored path, so an original that returns is recovered.
-    fn refresh(&mut self) {
+    fn refresh(&mut self, tx: &mut Tx) {
         let Some(index) = self.selected else { return };
         let Some(path) = self.assets.get(index).and_then(Print::path) else {
             return;
         };
-        let Some(cache) = &self.cache else {
-            self.status = "The library is starting. Try again in a moment.".into();
-            return;
-        };
-        match load_original(path, cache) {
-            Ok(print) => {
-                self.assets[index] = print;
+        match validate_original(path) {
+            Ok(filename) => {
+                self.local_images.invalidate(path);
+                self.assets[index] = Print::linked(path.to_path_buf(), Some(filename));
                 self.sync_selection();
+                self.focus_after_recovery(index, tx);
                 self.status = "Original refreshed.".into();
             }
             Err(err) => self.status = err.restore_message().into(),
@@ -596,7 +692,7 @@ impl Studio {
     }
 
     /// Point this reference at a new canonical path chosen by the user.
-    fn relocate(&mut self, previous: &Path, path: &Path) {
+    fn relocate(&mut self, previous: &Path, path: &Path, tx: &mut Tx) {
         let Some(index) = self
             .assets
             .iter()
@@ -621,23 +717,32 @@ impl Studio {
             self.status = "That image is already in your local library.".into();
             return;
         }
-        let Some(cache) = &self.cache else {
-            self.status = "The library is starting. Try again in a moment.".into();
-            return;
-        };
-        match load_original(&source, cache) {
-            Ok(print) => {
+        match validate_original(&source) {
+            Ok(filename) => {
+                self.local_images.invalidate(previous);
                 if self.comparison_first.as_deref() == Some(previous) {
-                    self.comparison_first = Some(source);
+                    self.comparison_first = Some(source.clone());
                 }
-                self.assets[index] = print;
+                self.assets[index] = Print::linked(source, Some(filename));
                 self.sync_selection();
+                self.focus_after_recovery(index, tx);
                 if self.persist_local() {
                     self.status = "Original located.".into();
                 }
             }
             Err(err) => self.status = err.restore_message().into(),
         }
+    }
+
+    fn focus_after_recovery(&self, index: usize, tx: &mut Tx) {
+        tx.focus(
+            if self.selected == Some(index) {
+                "featured-image"
+            } else {
+                "search-input"
+            },
+            true,
+        );
     }
 
     /// Drop only this reference and its favourite; the original file is untouched.
@@ -649,7 +754,9 @@ impl Studio {
         if self.comparison_first.as_deref() == Some(path) {
             self.comparison_first = None;
         }
+        self.local_images.invalidate(path);
         self.assets.remove(index);
+        let removed_from_draft = draft::forget_asset(self, index);
         self.favourites.retain(|&i| i != index);
         for favourite in &mut self.favourites {
             if *favourite > index {
@@ -658,25 +765,30 @@ impl Studio {
         }
         self.sync_selection();
         if self.persist_local() {
-            self.status = "Removed from library. Your original file is unchanged.".into();
+            self.status = if removed_from_draft {
+                "Removed from the library and draft. Your original file is unchanged.".into()
+            } else {
+                "Removed from library. Your original file is unchanged.".into()
+            };
         }
     }
 
     fn use_prompt(&mut self) {
-        let Some(study) = self
-            .selected
-            .and_then(|i| self.assets.get(i))
-            .and_then(Print::study)
-        else {
+        let Some(index) = self.selected else { return };
+        let Some(study) = self.assets.get(index).and_then(Print::study) else {
             return;
         };
         if self.draft.text.trim().is_empty() {
             self.draft = TextEdit::new(study.prompt);
             self.draft_dirty = true;
             self.status.clear();
+            if !self.draft_shortlist.contains(&index) {
+                draft::toggle(self, index);
+            }
         } else {
             self.status = "Your draft is still here. Clear it first to use this brief.".into();
         }
+        self.open_local_library();
         self.screen = Screen::Draft;
     }
 
@@ -722,9 +834,7 @@ impl OriginalError {
     }
 }
 
-/// The one loader for user images: import, startup, refresh and locate all
-/// apply the same file, size and format guards before touching the cache.
-fn read_original(path: &Path) -> Result<OriginalFile, OriginalError> {
+fn open_original(path: &Path) -> Result<(File, u64), OriginalError> {
     let meta = path.metadata().map_err(|_| OriginalError::Missing)?;
     if !meta.is_file() {
         return Err(OriginalError::Missing);
@@ -732,14 +842,12 @@ fn read_original(path: &Path) -> Result<OriginalFile, OriginalError> {
     if meta.len() > MAX_IMPORT {
         return Err(OriginalError::TooLarge);
     }
-    let file = File::open(path).map_err(|_| OriginalError::Unreadable)?;
-    let mut data = Vec::with_capacity(meta.len() as usize);
-    file.take(MAX_IMPORT + 1)
-        .read_to_end(&mut data)
-        .map_err(|_| OriginalError::Unreadable)?;
-    if data.len() as u64 > MAX_IMPORT {
-        return Err(OriginalError::TooLarge);
-    }
+    File::open(path)
+        .map(|file| (file, meta.len()))
+        .map_err(|_| OriginalError::Unreadable)
+}
+
+fn original_name(path: &Path, data: &[u8]) -> Result<String, OriginalError> {
     let file_type = if data.starts_with(&[0xff, 0xd8, 0xff]) {
         "jpg"
     } else if data.starts_with(b"\x89PNG\r\n\x1a\n") {
@@ -753,41 +861,44 @@ fn read_original(path: &Path) -> Result<OriginalFile, OriginalError> {
         || "Imported image".into(),
         |stem| stem.to_string_lossy().into_owned(),
     );
-    let filename = format!("{title}.{file_type}");
-    Ok(OriginalFile {
-        title,
-        filename,
-        bytes: data.into(),
-    })
+    Ok(format!("{title}.{file_type}"))
 }
 
-fn load_original(path: &Path, cache: &ImageCache) -> Result<Print, OriginalError> {
-    Ok(read_original(path)?.link(path.to_path_buf(), cache))
+/// A batch only checks each file's bounded header. Workers read image content
+/// as the contact sheet or selected preview needs it.
+fn validate_original(path: &Path) -> Result<String, OriginalError> {
+    let (file, _) = open_original(path)?;
+    let mut header = Vec::with_capacity(12);
+    file.take(12)
+        .read_to_end(&mut header)
+        .map_err(|_| OriginalError::Unreadable)?;
+    original_name(path, &header)
 }
 
 struct OriginalFile {
-    title: String,
     filename: String,
     bytes: Arc<[u8]>,
 }
 
-impl OriginalFile {
-    fn link(self, path: PathBuf, cache: &ImageCache) -> Print {
-        Print::new(
-            self.title,
-            self.filename,
-            Original::Linked {
-                path,
-                picture: Some(Picture::new(self.bytes, cache)),
-            },
-        )
+fn read_original(path: &Path) -> Result<OriginalFile, OriginalError> {
+    let (file, len) = open_original(path)?;
+    let mut data = Vec::with_capacity(len as usize);
+    file.take(MAX_IMPORT + 1)
+        .read_to_end(&mut data)
+        .map_err(|_| OriginalError::Unreadable)?;
+    if data.len() as u64 > MAX_IMPORT {
+        return Err(OriginalError::TooLarge);
     }
+    Ok(OriginalFile {
+        filename: original_name(path, &data)?,
+        bytes: data.into(),
+    })
 }
 
 const DUPLICATE_IMPORT: &str = "That image is already in your local library.";
 
 struct ImportBatch {
-    images: Vec<(PathBuf, OriginalFile)>,
+    images: Vec<(PathBuf, String)>,
     total: usize,
     first_error: Option<&'static str>,
     full: bool,
@@ -795,7 +906,7 @@ struct ImportBatch {
 
 impl ImportBatch {
     fn read(paths: Vec<PathBuf>, existing: Vec<PathBuf>) -> Self {
-        let available = local::MAX_REFS - existing.len();
+        let available = local::MAX_REFS.saturating_sub(existing.len());
         let mut batch = Self {
             images: Vec::new(),
             total: paths.len(),
@@ -807,7 +918,7 @@ impl ImportBatch {
                 batch.full = true;
                 batch
                     .first_error
-                    .get_or_insert("This library already holds 12 local images.");
+                    .get_or_insert("The local library is full.");
                 break;
             }
             let image = local::canonical(&path)
@@ -818,7 +929,7 @@ impl ImportBatch {
                     {
                         return Err(DUPLICATE_IMPORT);
                     }
-                    read_original(&path)
+                    validate_original(&path)
                         .map(|image| (path, image))
                         .map_err(OriginalError::import_message)
                 });
@@ -831,21 +942,6 @@ impl ImportBatch {
         }
         batch
     }
-}
-
-fn unavailable_print(path: &Path) -> Print {
-    let title = path.file_stem().map_or_else(
-        || "Saved local image".into(),
-        |stem| stem.to_string_lossy().into_owned(),
-    );
-    Print::new(
-        title,
-        "Original unavailable".into(),
-        Original::Linked {
-            path: path.to_path_buf(),
-            picture: None,
-        },
-    )
 }
 
 #[derive(Clone, Copy)]
@@ -1015,8 +1111,8 @@ fn locate(s: &mut Studio, tx: &mut Tx) {
         ..Default::default()
     }
     .filter("Images", &["jpg", "jpeg", "png", "webp"]);
-    tx.open_file(options, move |s: &mut Studio, answer, _| match answer {
-        Ok(Some(path)) => s.relocate(&previous, &path),
+    tx.open_file(options, move |s: &mut Studio, answer, tx| match answer {
+        Ok(Some(path)) => s.relocate(&previous, &path, tx),
         Ok(None) => (),
         Err(_) => s.status = "The system could not show the Open dialog.".into(),
     });
@@ -1029,11 +1125,19 @@ fn export(s: &mut Studio, tx: &mut Tx) {
     let Some(asset) = s.selected.and_then(|i| s.assets.get(i)) else {
         return;
     };
-    let Some(picture) = asset.picture() else {
-        s.status = "The original is unavailable. Refresh or locate it first.".into();
+    let Some(picture) = s.original(asset) else {
+        s.status = if asset.available() {
+            "Wait for the original to finish loading."
+        } else {
+            "The original is unavailable. Refresh or locate it first."
+        }
+        .into();
         return;
     };
-    let filename = asset.filename.clone();
+    let filename = asset
+        .path()
+        .and_then(|path| s.local_images.original(path))
+        .map_or_else(|| asset.filename.clone(), |image| image.filename.clone());
     let bytes = picture.bytes.clone();
     s.local_export = LocalExport::ChooseDestination;
     s.status.clear();
@@ -1063,11 +1167,12 @@ fn export(s: &mut Studio, tx: &mut Tx) {
 fn poll(s: &mut Studio, time: f64, tx: &mut Tx) -> bool {
     let hosted_updated = hosted::poll(s, time, tx);
     let imported = s.finish_import(tx);
+    let images_updated = s.poll_local_images();
     let LocalExport::WriteOriginal(write) = &s.local_export else {
-        return hosted_updated || imported;
+        return hosted_updated || imported || images_updated;
     };
     let Some(result) = write.take() else {
-        return hosted_updated || imported;
+        return hosted_updated || imported || images_updated;
     };
     s.local_export = LocalExport::Idle;
     s.status = match result {
@@ -1092,22 +1197,51 @@ fn finish_writes(s: &mut Studio, _: &mut Tx) {
     s.hosted.finish_write();
 }
 
-fn photo(asset: &Print, fit: SurfaceFit, p: Ink) -> El {
+fn photo(s: &Studio, asset: &Print, fit: SurfaceFit, p: Ink) -> El {
+    render_photo(
+        s.original(asset).map(|picture| &picture.image),
+        asset.available(),
+        fit,
+        false,
+        p,
+    )
+}
+
+fn thumbnail(s: &Studio, asset: &Print, p: Ink) -> El {
+    let image = asset
+        .path()
+        .and_then(|path| s.local_images.thumbnail(path))
+        .or_else(|| asset.picture().map(|picture| &picture.image));
+    render_photo(image, asset.available(), SurfaceFit::Fill, true, p)
+}
+
+fn render_photo(
+    image: Option<&Image>,
+    available: bool,
+    fit: SurfaceFit,
+    thumbnail: bool,
+    p: Ink,
+) -> El {
     let stage = el().w_full().h_full().fill(p.stage).clip_rounded(10.0);
-    let Some(picture) = asset.picture() else {
-        return stage
-            .center()
-            .child(label("Original unavailable", 12.0, 500.0, p.muted));
-    };
-    if picture.image.error().is_some() {
-        stage.center().child(label(
-            "This image could not be opened.",
-            14.0,
-            500.0,
-            p.muted,
-        ))
-    } else if picture.image.is_ready() {
-        stage.pixels_fit(picture.image.pixels(), fit)
+    if !available {
+        let (message, size) = if thumbnail {
+            ("Missing", 10.0)
+        } else {
+            ("Original unavailable", 12.0)
+        };
+        return stage.center().child(label(message, size, 500.0, p.muted));
+    }
+    if image.is_some_and(|image| image.error().is_some()) {
+        let (message, size) = if thumbnail {
+            ("Unreadable", 10.0)
+        } else {
+            ("This image could not be opened.", 14.0)
+        };
+        stage.center().child(label(message, size, 500.0, p.muted))
+    } else if let Some(image) = image.filter(|image| image.is_ready()) {
+        stage.pixels_fit(image.pixels(), fit)
+    } else if thumbnail {
+        stage
     } else {
         stage
             .center()
@@ -1171,6 +1305,7 @@ fn rail(s: &Studio, p: Ink) -> El {
             s.screen == Screen::Draft,
             p,
             |s, _| {
+                s.open_local_library();
                 s.status.clear();
                 s.screen = Screen::Draft;
             },
@@ -1231,12 +1366,12 @@ fn rail(s: &Studio, p: Ink) -> El {
 }
 
 fn inspector(s: &Studio, asset: &Print, p: Ink) -> El {
-    let size = asset
-        .picture()
+    let size = s
+        .original(asset)
         .and_then(|picture| picture.image.intrinsic_size())
         .map(|[w, h]| format!("{} × {} px", w as u32, h as u32));
     let dimensions = size.unwrap_or_else(|| {
-        if asset.picture().is_some() {
+        if asset.available() {
             asset.filename.clone()
         } else {
             "Original unavailable".into()
@@ -1251,7 +1386,7 @@ fn inspector(s: &Studio, asset: &Print, p: Ink) -> El {
         edition.source
     } else if asset.study().is_some() {
         "Afterlight · Sample artwork"
-    } else if asset.picture().is_some() {
+    } else if asset.available() {
         "Local import · Linked original"
     } else {
         "Local import · Original unavailable"
@@ -1316,19 +1451,20 @@ fn inspector(s: &Studio, asset: &Print, p: Ink) -> El {
             p,
             false,
             |s, _| s.favourite(),
-        ));
-    if asset.picture().is_some() {
+        ))
+        .child(draft::action_for_selection(s, p));
+    if s.original(asset).is_some() {
         actions = actions.child(export_action(s, "export", p));
     }
     if asset.path().is_some() {
-        if asset.picture().is_none() {
+        if !asset.available() {
             actions = actions
                 .child(action(
                     "refresh-original",
                     "Refresh original",
                     p,
                     false,
-                    |s, _| s.refresh(),
+                    |s, tx| s.refresh(tx),
                 ))
                 .child(action(
                     "locate-original",
@@ -1347,6 +1483,14 @@ fn inspector(s: &Studio, asset: &Print, p: Ink) -> El {
         ));
     }
     actions
+}
+
+fn contact_page(visible: &[usize], selected: Option<usize>) -> std::ops::Range<usize> {
+    let position = selected
+        .and_then(|index| visible.iter().position(|&item| item == index))
+        .unwrap_or(0);
+    let start = position / CONTACT_PAGE_SIZE * CONTACT_PAGE_SIZE;
+    start..(start + CONTACT_PAGE_SIZE).min(visible.len())
 }
 
 fn workspace(s: &Studio, p: Ink) -> El {
@@ -1461,7 +1605,7 @@ fn workspace(s: &Studio, p: Ink) -> El {
                 .child(label(message, 14.0, 500.0, p.muted).wrap()),
         );
     };
-    let view = photo(asset, SurfaceFit::Fit, p);
+    let view = photo(s, asset, SurfaceFit::Fit, p);
     let stage = el()
         .key("featured-image")
         .role("button")
@@ -1503,7 +1647,8 @@ fn workspace(s: &Studio, p: Ink) -> El {
             |s, _| s.inspector = !s.inspector,
         ));
     let mut strip = row().key("contact-sheet").w_full().gap(7.0);
-    for &i in &visible {
+    let page = contact_page(&visible, s.selected);
+    for &i in &visible[page.clone()] {
         let width = if visible.len() == 1 { 170.0 } else { f32::MAX };
         let tile = &s.assets[i];
         let chosen = s.selected == Some(i);
@@ -1525,11 +1670,7 @@ fn workspace(s: &Studio, p: Ink) -> El {
                 .focusable(true)
                 .focus_ring(2.0, 1.0, p.accent)
                 .cursor(Cursor::Pointer)
-                .child(
-                    el().w_full()
-                        .h(60.0)
-                        .child(photo(tile, SurfaceFit::Fill, p)),
-                )
+                .child(el().w_full().h(60.0).child(thumbnail(s, tile, p)))
                 .child(
                     label(
                         &tile.title,
@@ -1581,7 +1722,38 @@ fn workspace(s: &Studio, p: Ink) -> El {
     } else {
         strip
     };
-    body.child(stage).child(caption).child(strip).child(footer)
+    let mut body = body.child(stage).child(caption).child(strip);
+    if visible.len() > CONTACT_PAGE_SIZE {
+        let mut navigation = row().gap(8.0).items_center().justify_end();
+        if page.start > 0 {
+            navigation = navigation.child(action(
+                "previous-page",
+                "Previous page",
+                p,
+                false,
+                |s, tx| {
+                    s.turn_contact_page(false, tx);
+                },
+            ));
+        }
+        navigation = navigation.child(label(
+            format!(
+                "Page {} of {}",
+                page.start / CONTACT_PAGE_SIZE + 1,
+                visible.len().div_ceil(CONTACT_PAGE_SIZE)
+            ),
+            11.0,
+            550.0,
+            p.muted,
+        ));
+        if page.end < visible.len() {
+            navigation = navigation.child(action("next-page", "Next page", p, false, |s, tx| {
+                s.turn_contact_page(true, tx);
+            }));
+        }
+        body = body.child(navigation);
+    }
+    body.child(footer)
 }
 
 fn fullscreen(s: &Studio, p: Ink) -> El {
@@ -1621,7 +1793,7 @@ fn fullscreen(s: &Studio, p: Ink) -> El {
             el().w_full()
                 .grow(1.0)
                 .shrink()
-                .child(photo(asset, SurfaceFit::Fit, p)),
+                .child(photo(s, asset, SurfaceFit::Fit, p)),
         )
         .child(
             row()
@@ -1660,7 +1832,7 @@ fn drafting(s: &Studio, p: Ink) -> El {
         .child(label("Prompt draft", 36.0, 650.0, p.primary))
         .child(
             label(
-                "Write a brief of your own, or start from an Afterlight print.",
+                "Keep your brief and image choices together.",
                 14.0,
                 450.0,
                 p.muted,
@@ -1672,7 +1844,7 @@ fn drafting(s: &Studio, p: Ink) -> El {
                 .key("draft-input")
                 .label("Prompt draft")
                 .w_full()
-                .h(220.0)
+                .h(188.0)
                 .padding(16.0)
                 .radius(10.0)
                 .fill(p.field)
@@ -1703,6 +1875,7 @@ fn drafting(s: &Studio, p: Ink) -> El {
                 }))
                 .child(label(&s.status, 12.0, 500.0, p.muted).wrap()),
         )
+        .child(draft::shortlist(s, p))
 }
 
 fn view(s: &Studio, _: &mut Cx<Studio>) -> El {
@@ -1745,6 +1918,9 @@ fn keyboard(s: &mut Studio, event: &KeyEvent, tx: &mut Tx) -> bool {
             s.clear_search();
             tx.blur();
         }
+        Key::Escape if matches!(s.screen, Screen::Compare(_)) => {
+            comparison::return_to_workspace(s, tx);
+        }
         Key::Escape if s.screen != Screen::Workspace => {
             s.screen = Screen::Workspace;
             tx.blur();
@@ -1758,9 +1934,13 @@ fn keyboard(s: &mut Studio, event: &KeyEvent, tx: &mut Tx) -> bool {
             export(s, tx)
         }
         Key::Left | Key::Right if matches!(s.screen, Screen::Workspace | Screen::Preview) => {
+            let focused_tile = tx.focused().is_some_and(|key| key.starts_with("print-"));
             s.step(if event.key == Key::Left { -1 } else { 1 });
             if s.screen == Screen::Workspace {
                 s.reveal_selection(tx);
+                if focused_tile && let Some(index) = s.selected {
+                    tx.focus(format!("print-{index}"), true);
+                }
             }
         }
         Key::Enter

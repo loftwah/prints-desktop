@@ -1,4 +1,4 @@
-use rune::{El, SurfaceFit, col, el, row};
+use rune::{El, SurfaceFit, Tx, col, el, row};
 
 use crate::{Ink, Print, Screen, Studio, action, label, photo};
 
@@ -10,16 +10,31 @@ pub(crate) enum Pair {
     Local(usize, usize),
 }
 
+fn open(s: &mut Studio, tx: &mut Tx, pair: Pair) {
+    s.screen = Screen::Compare(pair);
+    tx.focus("close-comparison", tx.by_keys() || tx.focus_visible());
+}
+
+pub(crate) fn return_to_workspace(s: &mut Studio, tx: &mut Tx) {
+    let key = match s.screen {
+        Screen::Compare(Pair::Campaign) => "compare-editions",
+        Screen::Compare(Pair::Local(..)) => "compare-local",
+        _ => return,
+    };
+    s.screen = Screen::Workspace;
+    tx.focus(key, tx.by_keys() || tx.focus_visible());
+}
+
 fn first_local(s: &Studio) -> Option<usize> {
     let path = s.comparison_first.as_deref()?;
     s.assets
         .iter()
-        .position(|asset| asset.path() == Some(path) && asset.picture().is_some())
+        .position(|asset| asset.path() == Some(path) && asset.available())
 }
 
 pub(crate) fn caption(s: &Studio, asset: &Print) -> String {
     if asset.path().is_some()
-        && asset.picture().is_some()
+        && asset.available()
         && let Some(first) = first_local(s)
     {
         return if s.selected == Some(first) {
@@ -41,39 +56,39 @@ pub(crate) fn control(s: &Studio, asset: &Print, p: Ink) -> Option<El> {
             "Compare formats",
             p,
             false,
-            |s, tx| {
-                s.screen = Screen::Compare(Pair::Campaign);
-                tx.blur();
-            },
+            |s, tx| open(s, tx, Pair::Campaign),
         ));
     }
     let current = s.selected?;
     let path = asset.path()?.to_path_buf();
-    asset.picture()?;
+    if !asset.available() {
+        return None;
+    }
     let button = match first_local(s) {
         None => action(
             "choose-comparison",
             "Set first image",
             p,
             false,
-            move |s, _| {
+            move |s, tx| {
                 s.comparison_first = Some(path.clone());
+                tx.focus("clear-comparison", tx.by_keys() || tx.focus_visible());
             },
         ),
         Some(first) if first == current => {
-            action("clear-comparison", "Clear comparison", p, false, |s, _| {
+            action("clear-comparison", "Clear comparison", p, false, |s, tx| {
                 s.comparison_first = None;
+                tx.focus("choose-comparison", tx.by_keys() || tx.focus_visible());
             })
         }
         Some(first) => action("compare-local", "Compare images", p, false, move |s, tx| {
-            s.screen = Screen::Compare(Pair::Local(first, current));
-            tx.blur();
+            open(s, tx, Pair::Local(first, current));
         }),
     };
     Some(button)
 }
 
-fn panel(asset: &Print, title: &str, p: Ink) -> El {
+fn panel(s: &Studio, asset: &Print, title: &str, p: Ink) -> El {
     col()
         .grow(1.0)
         .shrink()
@@ -84,7 +99,7 @@ fn panel(asset: &Print, title: &str, p: Ink) -> El {
             el().w_full()
                 .grow(1.0)
                 .shrink()
-                .child(photo(asset, SurfaceFit::Fit, p)),
+                .child(photo(s, asset, SurfaceFit::Fit, p)),
         )
         .child(label(&asset.filename, 12.0, 500.0, p.muted).truncate_middle())
 }
@@ -121,8 +136,8 @@ pub(crate) fn view(s: &Studio, pair: Pair, p: Ink) -> El {
                 .grow(1.0)
                 .shrink()
                 .gap(15.0)
-                .child(panel(first, first_title, p))
-                .child(panel(second, second_title, p))
+                .child(panel(s, first, first_title, p))
+                .child(panel(s, second, second_title, p))
         }
         _ => label(
             "The comparison formats are unavailable.",
@@ -154,10 +169,7 @@ pub(crate) fn view(s: &Studio, pair: Pair, p: Ink) -> El {
                     "Back to contact sheet",
                     p,
                     false,
-                    |s, tx| {
-                        s.screen = Screen::Workspace;
-                        tx.blur();
-                    },
+                    return_to_workspace,
                 )),
         )
         .child(panels)

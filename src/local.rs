@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-pub const MAX_REFS: usize = 12;
+pub const MAX_REFS: usize = 300;
 pub const LIBRARY_KEY: &str = "linked-originals";
 
 #[derive(Deserialize, Serialize)]
@@ -13,6 +13,8 @@ pub struct Reference {
     #[serde(with = "native_path")]
     pub path: PathBuf,
     pub favourite: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub in_draft: bool,
 }
 
 pub fn canonical(path: &Path) -> Option<PathBuf> {
@@ -79,14 +81,17 @@ mod tests {
             serde_json::from_str(r#"{"path":"/first.jpg","favourite":true}"#).unwrap();
         assert_eq!(old.path, Path::new("/first.jpg"));
         assert!(old.favourite);
+        assert!(!old.in_draft);
 
         let reference = Reference {
             path: OsString::from_vec(b"/x\xff.jpg".to_vec()).into(),
             favourite: true,
+            in_draft: true,
         };
         let encoded = serde_json::to_string(&reference).unwrap();
         let decoded: Reference = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded.path, reference.path);
         assert!(decoded.favourite);
+        assert!(decoded.in_draft);
     }
 }
