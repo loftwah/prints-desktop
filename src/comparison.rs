@@ -4,44 +4,126 @@ use crate::{Ink, Print, Screen, Studio, action, label, photo};
 
 const CAMPAIGN_PRINTS: [&str; 2] = ["higher-than-before.jpg", "higher-than-before-poster.jpg"];
 
-pub(crate) fn applies(s: &Studio) -> bool {
-    s.selected
-        .and_then(|i| s.assets.get(i))
-        .and_then(Print::edition)
-        .is_some_and(|edition| CAMPAIGN_PRINTS.contains(&edition.filename))
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Pair {
+    Campaign,
+    Local(usize, usize),
 }
 
-fn panel(asset: &Print, format: &str, p: Ink) -> El {
+fn first_local(s: &Studio) -> Option<usize> {
+    let path = s.comparison_first.as_deref()?;
+    s.assets
+        .iter()
+        .position(|asset| asset.path() == Some(path) && asset.picture().is_some())
+}
+
+pub(crate) fn caption(s: &Studio, asset: &Print) -> String {
+    if asset.path().is_some()
+        && asset.picture().is_some()
+        && let Some(first) = first_local(s)
+    {
+        return if s.selected == Some(first) {
+            "Select a second image to compare.".into()
+        } else {
+            format!("Compare with {}", s.assets[first].title)
+        };
+    }
+    asset.caption().into()
+}
+
+pub(crate) fn control(s: &Studio, asset: &Print, p: Ink) -> Option<El> {
+    if asset
+        .edition()
+        .is_some_and(|edition| CAMPAIGN_PRINTS.contains(&edition.filename))
+    {
+        return Some(action(
+            "compare-editions",
+            "Compare formats",
+            p,
+            false,
+            |s, tx| {
+                s.screen = Screen::Compare(Pair::Campaign);
+                tx.blur();
+            },
+        ));
+    }
+    let current = s.selected?;
+    let path = asset.path()?.to_path_buf();
+    asset.picture()?;
+    let button = match first_local(s) {
+        None => action(
+            "choose-comparison",
+            "Set first image",
+            p,
+            false,
+            move |s, _| {
+                s.comparison_first = Some(path.clone());
+            },
+        ),
+        Some(first) if first == current => {
+            action("clear-comparison", "Clear comparison", p, false, |s, _| {
+                s.comparison_first = None;
+            })
+        }
+        Some(first) => action("compare-local", "Compare images", p, false, move |s, tx| {
+            s.screen = Screen::Compare(Pair::Local(first, current));
+            tx.blur();
+        }),
+    };
+    Some(button)
+}
+
+fn panel(asset: &Print, title: &str, p: Ink) -> El {
     col()
         .grow(1.0)
         .shrink()
         .gap(8.0)
-        .child(label(format, 18.0, 650.0, p.primary))
+        .min_w(0.0)
+        .child(label(title, 18.0, 650.0, p.primary).truncate())
         .child(
             el().w_full()
                 .grow(1.0)
                 .shrink()
                 .child(photo(asset, SurfaceFit::Fit, p)),
         )
-        .child(label(&asset.filename, 12.0, 500.0, p.muted))
+        .child(label(&asset.filename, 12.0, 500.0, p.muted).truncate_middle())
 }
 
-pub(crate) fn view(s: &Studio, p: Ink) -> El {
-    let editions = CAMPAIGN_PRINTS.map(|name| {
-        s.assets.iter().find(|asset| {
-            asset
-                .edition()
-                .is_some_and(|edition| edition.filename == name)
-        })
-    });
-    let panels = match editions {
-        [Some(cover), Some(poster)] => row()
-            .w_full()
-            .grow(1.0)
-            .shrink()
-            .gap(15.0)
-            .child(panel(cover, "Album cover", p))
-            .child(panel(poster, "Release poster", p)),
+pub(crate) fn view(s: &Studio, pair: Pair, p: Ink) -> El {
+    let (key, title, description, images) = match pair {
+        Pair::Campaign => (
+            "campaign-comparison",
+            "Higher Than Before",
+            "One release, two formats. Compare the artwork at its original proportions.",
+            CAMPAIGN_PRINTS.map(|name| {
+                s.assets.iter().find(|asset| {
+                    asset
+                        .edition()
+                        .is_some_and(|edition| edition.filename == name)
+                })
+            }),
+        ),
+        Pair::Local(first, second) => (
+            "local-comparison",
+            "Compare images",
+            "Both originals shown at their own proportions.",
+            [s.assets.get(first), s.assets.get(second)],
+        ),
+    };
+    let panels = match images {
+        [Some(first), Some(second)] => {
+            let [first_title, second_title] = match pair {
+                Pair::Campaign => ["Album cover", "Release poster"],
+                Pair::Local(..) => [first.title.as_str(), second.title.as_str()],
+            };
+            row()
+                .w_full()
+                .grow(1.0)
+                .shrink()
+                .gap(15.0)
+                .child(panel(first, first_title, p))
+                .child(panel(second, second_title, p))
+        }
         _ => label(
             "The comparison formats are unavailable.",
             14.0,
@@ -50,7 +132,7 @@ pub(crate) fn view(s: &Studio, p: Ink) -> El {
         ),
     };
     col()
-        .key("campaign-comparison")
+        .key(key)
         .w_full()
         .h_full()
         .padding(20.0)
@@ -64,18 +146,19 @@ pub(crate) fn view(s: &Studio, p: Ink) -> El {
                     col()
                         .grow(1.0)
                         .gap(4.0)
-                        .child(label("Higher Than Before", 27.0, 650.0, p.primary))
-                        .child(label(
-                            "One release, two formats. Compare the artwork at its original proportions.",
-                            13.0,
-                            450.0,
-                            p.muted,
-                        ).wrap()),
+                        .child(label(title, 27.0, 650.0, p.primary))
+                        .child(label(description, 13.0, 450.0, p.muted).wrap()),
                 )
-                .child(action("close-comparison", "Back to contact sheet", p, false, |s, tx| {
-                    s.screen = Screen::Workspace;
-                    tx.blur();
-                })),
+                .child(action(
+                    "close-comparison",
+                    "Back to contact sheet",
+                    p,
+                    false,
+                    |s, tx| {
+                        s.screen = Screen::Workspace;
+                        tx.blur();
+                    },
+                )),
         )
         .child(panels)
 }

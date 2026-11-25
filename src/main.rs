@@ -18,7 +18,7 @@ use rune::prefs::Prefs;
 use rune::tok::TextStyle;
 use rune::{
     App, AppSpec, Color, Cursor, Cx, El, FileDialogOptions, Image, ImageCache, Key, KeyEvent,
-    ScrollSpec, SurfaceFit, TextEdit, Tx, Waker, col, el, row, text, text_input,
+    Latest, ScrollSpec, SurfaceFit, TextEdit, Tx, Waker, col, el, row, text, text_input,
 };
 
 const APP_ID: &str = "com.loftwah.prints-desktop";
@@ -89,7 +89,7 @@ enum Shelf {
 enum Screen {
     Workspace,
     Preview,
-    Compare,
+    Compare(comparison::Pair),
     Draft,
     Connection,
     Hosted,
@@ -223,6 +223,7 @@ struct Studio {
     screen: Screen,
     assets: Vec<Print>,
     selected: Option<usize>,
+    comparison_first: Option<PathBuf>,
     favourites: Vec<usize>,
     theme_light: bool,
     inspector: bool,
@@ -232,6 +233,8 @@ struct Studio {
     status: String,
     prefs: Prefs,
     cache: Option<ImageCache>,
+    import_request: Latest<ImportBatch>,
+    import_origin: Option<(Screen, Shelf)>,
     local_export: LocalExport,
     wake: Option<Waker>,
     local_loaded: bool,
@@ -276,6 +279,7 @@ impl Studio {
             screen: Screen::Workspace,
             assets: Vec::new(),
             selected: Some(AFTERLIGHT.len()),
+            comparison_first: None,
             favourites,
             theme_light,
             inspector: true,
@@ -285,6 +289,8 @@ impl Studio {
             status: String::new(),
             prefs,
             cache: None,
+            import_request: Latest::default(),
+            import_origin: None,
             local_export: LocalExport::Idle,
             wake: None,
             local_loaded: false,
@@ -295,6 +301,7 @@ impl Studio {
 
     fn load(&mut self, wake: Waker) {
         self.hosted.set_waker(wake.clone());
+        self.import_request.set_waker(wake.clone());
         self.wake = Some(wake.clone());
         let cache = ImageCache::new(wake);
         self.assets = AFTERLIGHT
@@ -500,24 +507,72 @@ impl Studio {
         }
     }
 
-    fn import(&mut self, path: &Path) -> Result<(), &'static str> {
+    fn import(&mut self, paths: Vec<PathBuf>) {
+        if paths.is_empty() {
+            return;
+        }
+        if self.import_origin.is_some() {
+            self.status = "Wait for the current import to finish.".into();
+            return;
+        }
         self.open_local_library();
-        let Some(cache) = &self.cache else {
-            return Err("The library is starting. Try again in a moment.");
+        if self.cache.is_none() {
+            self.status = "The library is starting. Try again in a moment.".into();
+            return;
+        }
+        let existing: Vec<_> = self.refs().map(Path::to_path_buf).collect();
+        self.import_origin = Some((self.screen, self.shelf));
+        self.status = "Linking images…".into();
+        self.import_request
+            .request((paths, existing), |(paths, existing)| {
+                ImportBatch::read(paths, existing)
+            });
+    }
+
+    fn finish_import(&mut self, tx: &mut Tx) -> bool {
+        let Some(batch) = self.import_request.take() else {
+            return false;
         };
-        if self.refs().count() >= local::MAX_REFS {
-            return Err("This library already holds 12 local images.");
+        let origin = self.import_origin.take();
+        let Some(cache) = &self.cache else {
+            return false;
+        };
+        let start = self.assets.len();
+        for (path, original) in batch.images {
+            // A linked image can be relocated while the batch is being read.
+            if !self.refs().any(|existing| existing == path) {
+                self.assets.push(original.link(path, cache));
+            }
         }
-        let source = local::canonical(path).ok_or("This file could not be read.")?;
-        if self.refs().any(|path| path == source) {
-            return Err("That image is already in your local library.");
+        let linked = self.assets.len() - start;
+        if linked > 0 {
+            if origin == Some((self.screen, self.shelf)) {
+                self.show_shelf(Shelf::Imports);
+                self.selected = Some(start);
+                tx.blur();
+                self.reveal_selection(tx);
+            } else if self.screen == Screen::Workspace && self.shelf == Shelf::Imports {
+                self.sync_selection();
+            }
+            if !self.persist_local() {
+                return true;
+            }
         }
-        let print = load_original(&source, cache).map_err(OriginalError::import_message)?;
-        self.assets.push(print);
-        self.selected = Some(self.assets.len() - 1);
-        self.show_shelf(Shelf::Imports);
-        self.persist_local();
-        Ok(())
+        self.status = match (linked, batch.total) {
+            (0, 1) => batch.first_error.unwrap_or(DUPLICATE_IMPORT).into(),
+            (1, 1) => "Image linked.".into(),
+            (linked, total) if linked == total => format!("Linked {linked} images."),
+            (linked, total) if batch.full => {
+                format!(
+                    "Linked {linked} of {total} files. Library limit: {}.",
+                    local::MAX_REFS
+                )
+            }
+            (linked, total) => format!(
+                "Linked {linked} of {total} files. Skipped duplicates or unreadable images."
+            ),
+        };
+        true
     }
 
     /// Re-read the stored path, so an original that returns is recovered.
@@ -572,6 +627,9 @@ impl Studio {
         };
         match load_original(&source, cache) {
             Ok(print) => {
+                if self.comparison_first.as_deref() == Some(previous) {
+                    self.comparison_first = Some(source);
+                }
                 self.assets[index] = print;
                 self.sync_selection();
                 if self.persist_local() {
@@ -585,8 +643,11 @@ impl Studio {
     /// Drop only this reference and its favourite; the original file is untouched.
     fn remove_local(&mut self) {
         let Some(index) = self.selected else { return };
-        if self.assets.get(index).and_then(Print::path).is_none() {
+        let Some(path) = self.assets.get(index).and_then(Print::path) else {
             return;
+        };
+        if self.comparison_first.as_deref() == Some(path) {
+            self.comparison_first = None;
         }
         self.assets.remove(index);
         self.favourites.retain(|&i| i != index);
@@ -663,7 +724,7 @@ impl OriginalError {
 
 /// The one loader for user images: import, startup, refresh and locate all
 /// apply the same file, size and format guards before touching the cache.
-fn read_original(path: &Path) -> Result<(String, String, Arc<[u8]>), OriginalError> {
+fn read_original(path: &Path) -> Result<OriginalFile, OriginalError> {
     let meta = path.metadata().map_err(|_| OriginalError::Missing)?;
     if !meta.is_file() {
         return Err(OriginalError::Missing);
@@ -693,19 +754,83 @@ fn read_original(path: &Path) -> Result<(String, String, Arc<[u8]>), OriginalErr
         |stem| stem.to_string_lossy().into_owned(),
     );
     let filename = format!("{title}.{file_type}");
-    Ok((title, filename, data.into()))
+    Ok(OriginalFile {
+        title,
+        filename,
+        bytes: data.into(),
+    })
 }
 
 fn load_original(path: &Path, cache: &ImageCache) -> Result<Print, OriginalError> {
-    let (title, filename, bytes) = read_original(path)?;
-    Ok(Print::new(
-        title,
-        filename,
-        Original::Linked {
-            path: path.to_path_buf(),
-            picture: Some(Picture::new(bytes, cache)),
-        },
-    ))
+    Ok(read_original(path)?.link(path.to_path_buf(), cache))
+}
+
+struct OriginalFile {
+    title: String,
+    filename: String,
+    bytes: Arc<[u8]>,
+}
+
+impl OriginalFile {
+    fn link(self, path: PathBuf, cache: &ImageCache) -> Print {
+        Print::new(
+            self.title,
+            self.filename,
+            Original::Linked {
+                path,
+                picture: Some(Picture::new(self.bytes, cache)),
+            },
+        )
+    }
+}
+
+const DUPLICATE_IMPORT: &str = "That image is already in your local library.";
+
+struct ImportBatch {
+    images: Vec<(PathBuf, OriginalFile)>,
+    total: usize,
+    first_error: Option<&'static str>,
+    full: bool,
+}
+
+impl ImportBatch {
+    fn read(paths: Vec<PathBuf>, existing: Vec<PathBuf>) -> Self {
+        let available = local::MAX_REFS - existing.len();
+        let mut batch = Self {
+            images: Vec::new(),
+            total: paths.len(),
+            first_error: None,
+            full: false,
+        };
+        for path in paths {
+            if batch.images.len() == available {
+                batch.full = true;
+                batch
+                    .first_error
+                    .get_or_insert("This library already holds 12 local images.");
+                break;
+            }
+            let image = local::canonical(&path)
+                .ok_or(OriginalError::Missing.import_message())
+                .and_then(|path| {
+                    if existing.contains(&path)
+                        || batch.images.iter().any(|(added, _)| added == &path)
+                    {
+                        return Err(DUPLICATE_IMPORT);
+                    }
+                    read_original(&path)
+                        .map(|image| (path, image))
+                        .map_err(OriginalError::import_message)
+                });
+            match image {
+                Ok(image) => batch.images.push(image),
+                Err(reason) => {
+                    batch.first_error.get_or_insert(reason);
+                }
+            }
+        }
+        batch
+    }
 }
 
 fn unavailable_print(path: &Path) -> Print {
@@ -857,17 +982,18 @@ fn nav(
         .on_press_tx(run)
 }
 
-fn file_open(_: &mut Studio, tx: &mut Tx) {
+fn file_open(s: &mut Studio, tx: &mut Tx) {
+    if s.import_origin.is_some() {
+        s.status = "Wait for the current import to finish.".into();
+        return;
+    }
     let options = FileDialogOptions {
         title: "Import an image".into(),
         ..Default::default()
     }
     .filter("Images", &["jpg", "jpeg", "png", "webp"]);
-    tx.open_file(options, |s: &mut Studio, answer, tx| match answer {
-        Ok(Some(path)) => match s.import(&path) {
-            Ok(()) => s.reveal_selection(tx),
-            Err(err) => s.status = err.into(),
-        },
+    tx.open_file(options, |s: &mut Studio, answer, _| match answer {
+        Ok(Some(path)) => s.import(vec![path]),
         Ok(None) => (),
         Err(_) => s.status = "The system could not show the Open dialog.".into(),
     });
@@ -936,11 +1062,12 @@ fn export(s: &mut Studio, tx: &mut Tx) {
 
 fn poll(s: &mut Studio, time: f64, tx: &mut Tx) -> bool {
     let hosted_updated = hosted::poll(s, time, tx);
+    let imported = s.finish_import(tx);
     let LocalExport::WriteOriginal(write) = &s.local_export else {
-        return hosted_updated;
+        return hosted_updated || imported;
     };
     let Some(result) = write.take() else {
-        return hosted_updated;
+        return hosted_updated || imported;
     };
     s.local_export = LocalExport::Idle;
     s.status = match result {
@@ -1355,18 +1482,10 @@ fn workspace(s: &Studio, p: Ink) -> El {
             .min_w(0.0)
             .gap(3.0)
             .child(label(&asset.title, 19.0, 620.0, p.primary).truncate())
-            .child(label(asset.caption(), 12.0, 450.0, p.muted).truncate()),
+            .child(label(comparison::caption(s, asset), 12.0, 450.0, p.muted).truncate()),
     );
-    if comparison::applies(s) {
-        caption = caption.child(action(
-            "compare-editions",
-            "Compare formats",
-            p,
-            false,
-            |s, _| {
-                s.screen = Screen::Compare;
-            },
-        ));
+    if let Some(compare) = comparison::control(s, asset, p) {
+        caption = caption.child(compare);
     }
     caption = caption
         .child(action("preview", "Full view", p, false, |s, _| {
@@ -1592,8 +1711,8 @@ fn view(s: &Studio, _: &mut Cx<Studio>) -> El {
     if s.screen == Screen::Preview {
         return shell.child(fullscreen(s, p));
     }
-    if s.screen == Screen::Compare {
-        return shell.child(comparison::view(s, p));
+    if let Screen::Compare(pair) = s.screen {
+        return shell.child(comparison::view(s, pair, p));
     }
     shell = shell.child(rail(s, p));
     match s.screen {
@@ -1608,16 +1727,11 @@ fn view(s: &Studio, _: &mut Cx<Studio>) -> El {
         Screen::Draft => shell = shell.child(drafting(s, p)),
         Screen::Connection => shell = shell.child(hosted::connection(s, p)),
         Screen::Hosted => shell = shell.child(hosted::library(s, p)),
-        Screen::Preview | Screen::Compare => unreachable!(),
+        Screen::Preview | Screen::Compare(_) => unreachable!(),
     }
-    shell.on_drop_files(|s: &mut Studio, paths, tx| {
-        if s.screen == Screen::Workspace
-            && let Some(path) = paths.first()
-        {
-            match s.import(path) {
-                Ok(()) => s.reveal_selection(tx),
-                Err(err) => s.status = err.into(),
-            }
+    shell.on_drop_files(|s: &mut Studio, paths, _| {
+        if s.screen == Screen::Workspace {
+            s.import(paths.to_vec());
         }
     })
 }
