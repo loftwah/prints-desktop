@@ -3,10 +3,11 @@
 
 use std::fs::File;
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 mod hosted;
+mod local;
 
 use rune::prefs::Prefs;
 use rune::tok::TextStyle;
@@ -93,6 +94,10 @@ struct Print {
     bytes: Arc<[u8]>,
     image: Image,
     study: Option<usize>,
+    // Canonical path to the user's original, never a copy kept by the app.
+    source: Option<PathBuf>,
+    // A saved original may be missing for a while; keep the reference so it can return.
+    available: bool,
 }
 
 struct Studio {
@@ -108,6 +113,7 @@ struct Studio {
     status: String,
     prefs: Prefs,
     cache: Option<ImageCache>,
+    local_loaded: bool,
     proof: bool,
     hosted: hosted::Hosted,
 }
@@ -118,7 +124,8 @@ impl Studio {
             && std::env::args()
                 .any(|arg| matches!(arg.as_str(), "--snap" | "--tree" | "--script" | "--video"));
         let prefs = if proof {
-            Prefs::memory()
+            std::env::var_os("PRINTS_REPLAY_PREFS")
+                .map_or_else(Prefs::memory, |path| Prefs::at(PathBuf::from(path)))
         } else {
             Prefs::open(APP_ID)
         };
@@ -142,6 +149,7 @@ impl Studio {
             status: String::new(),
             prefs,
             cache: None,
+            local_loaded: false,
             proof,
             hosted,
         }
@@ -162,6 +170,8 @@ impl Studio {
                     bytes,
                     image,
                     study: Some(index),
+                    source: None,
+                    available: true,
                 }
             })
             .collect();
@@ -171,6 +181,53 @@ impl Studio {
             }
         }
         self.cache = Some(cache);
+    }
+
+    fn open_local_library(&mut self) {
+        if self.local_loaded {
+            return;
+        }
+        let Some(cache) = &self.cache else {
+            return;
+        };
+        self.local_loaded = true;
+        for record in local::read(self.prefs.get(local::LIBRARY_KEY)) {
+            if record.favourite {
+                self.favourites.push(self.assets.len());
+            }
+            let print = load_original(&record.path, cache)
+                .unwrap_or_else(|_| unavailable_print(&record.path, cache));
+            if self.proof && print.available {
+                let _ = print.image.wait();
+            }
+            self.assets.push(print);
+        }
+    }
+
+    fn refs(&self) -> Vec<PathBuf> {
+        self.assets
+            .iter()
+            .filter_map(|asset| asset.source.clone())
+            .collect()
+    }
+
+    fn persist_local(&mut self) -> bool {
+        let originals: Vec<_> = self
+            .assets
+            .iter()
+            .enumerate()
+            .filter_map(|(index, asset)| {
+                Some(local::Reference {
+                    path: asset.source.clone()?,
+                    favourite: self.favourites.contains(&index),
+                })
+            })
+            .collect();
+        if self.prefs.set(local::LIBRARY_KEY, &originals).is_err() {
+            self.status = "The local library could not be saved to disk.".into();
+            return false;
+        }
+        true
     }
 
     fn visible(&self) -> Vec<usize> {
@@ -189,6 +246,9 @@ impl Studio {
     }
 
     fn show_shelf(&mut self, shelf: Shelf) {
+        if shelf != Shelf::Samples {
+            self.open_local_library();
+        }
         self.shelf = shelf;
         self.screen = Screen::Workspace;
         self.status.clear();
@@ -219,17 +279,21 @@ impl Studio {
         } else {
             self.favourites.push(i);
         }
-        let samples: Vec<usize> = self
-            .favourites
-            .iter()
-            .copied()
-            .filter(|&i| i < AFTERLIGHT.len())
-            .collect();
-        self.status = if self.prefs.set("favourites", &samples).is_ok() {
-            String::new()
-        } else {
-            "Favourites could not be saved to disk.".into()
-        };
+        if i < AFTERLIGHT.len() {
+            let samples: Vec<usize> = self
+                .favourites
+                .iter()
+                .copied()
+                .filter(|&i| i < AFTERLIGHT.len())
+                .collect();
+            self.status = if self.prefs.set("favourites", &samples).is_ok() {
+                String::new()
+            } else {
+                "Favourites could not be saved to disk.".into()
+            };
+        } else if self.persist_local() {
+            self.status.clear();
+        }
         if self.shelf == Shelf::Favourites && !self.favourites.contains(&i) {
             self.selected = self.visible().first().copied();
             if self.selected.is_none() {
@@ -246,52 +310,125 @@ impl Studio {
     }
 
     fn import(&mut self, path: &Path) -> Result<(), &'static str> {
+        self.open_local_library();
         let Some(cache) = &self.cache else {
             return Err("The library is starting. Try again in a moment.");
         };
-        let meta = path
-            .metadata()
-            .map_err(|_| "This file could not be read.")?;
-        if !meta.is_file() || meta.len() > MAX_IMPORT {
-            return Err("Choose an image file no larger than 24 MB.");
+        if self.refs().len() >= local::MAX_REFS {
+            return Err("This library already holds 12 local images.");
         }
-        if self.assets.len() >= AFTERLIGHT.len() + 12 {
-            return Err("Start a fresh session to import more than 12 images.");
+        let source = local::canonical(path).ok_or("This file could not be read.")?;
+        if source.to_str().is_none() {
+            return Err("This image's location can't be saved on this device.");
         }
-        let file = File::open(path).map_err(|_| "This file could not be opened.")?;
-        let mut data = Vec::new();
-        file.take(MAX_IMPORT + 1)
-            .read_to_end(&mut data)
-            .map_err(|_| "This file could not be read.")?;
-        if data.len() as u64 > MAX_IMPORT {
-            return Err("Choose an image file no larger than 24 MB.");
+        if self.refs().contains(&source) {
+            return Err("That image is already in your local library.");
         }
-        let file_type = if data.starts_with(&[0xff, 0xd8, 0xff]) {
-            "jpg"
-        } else if data.starts_with(b"\x89PNG\r\n\x1a\n") {
-            "png"
-        } else if data.starts_with(b"RIFF") && data.get(8..12) == Some(b"WEBP") {
-            "webp"
-        } else {
-            return Err("Choose a JPEG, PNG or WebP image.");
-        };
-        let title = path.file_stem().map_or_else(
-            || "Imported image".into(),
-            |s| s.to_string_lossy().into_owned(),
-        );
-        let filename = format!("{title}.{file_type}");
-        let bytes: Arc<[u8]> = data.into();
-        let image = cache.load(bytes.clone());
-        self.assets.push(Print {
-            title,
-            filename,
-            bytes,
-            image,
-            study: None,
-        });
+        let print = load_original(&source, cache).map_err(OriginalError::import_message)?;
+        self.assets.push(print);
         self.selected = Some(self.assets.len() - 1);
         self.show_shelf(Shelf::Imports);
+        self.persist_local();
         Ok(())
+    }
+
+    /// Re-read the stored path, so an original that returns is recovered.
+    fn refresh(&mut self) {
+        let Some(index) = self.selected else { return };
+        if self
+            .assets
+            .get(index)
+            .is_none_or(|asset| asset.study.is_some())
+        {
+            return;
+        }
+        let Some(path) = self.assets[index].source.clone() else {
+            return;
+        };
+        let Some(cache) = &self.cache else {
+            self.status = "The library is starting. Try again in a moment.".into();
+            return;
+        };
+        match load_original(&path, cache) {
+            Ok(print) => {
+                self.assets[index] = print;
+                self.status = "Original refreshed.".into();
+            }
+            Err(err) => self.status = err.restore_message().into(),
+        }
+    }
+
+    /// Point this reference at a new canonical path chosen by the user.
+    fn relocate(&mut self, path: &Path) {
+        let Some(index) = self.selected else { return };
+        if self
+            .assets
+            .get(index)
+            .is_none_or(|asset| asset.study.is_some())
+        {
+            return;
+        }
+        let source = match local::canonical(path) {
+            Some(source) => source,
+            None => {
+                self.status = "That file could not be read.".into();
+                return;
+            }
+        };
+        if source.to_str().is_none() {
+            self.status = "This image's location can't be saved on this device.".into();
+            return;
+        }
+        let others: Vec<PathBuf> = self
+            .assets
+            .iter()
+            .enumerate()
+            .filter(|&(i, _)| i != index)
+            .filter_map(|(_, asset)| asset.source.clone())
+            .collect();
+        if others.contains(&source) {
+            self.status = "That image is already in your local library.".into();
+            return;
+        }
+        let Some(cache) = &self.cache else {
+            self.status = "The library is starting. Try again in a moment.".into();
+            return;
+        };
+        match load_original(&source, cache) {
+            Ok(print) => {
+                self.assets[index] = print;
+                if self.persist_local() {
+                    self.status = "Original located.".into();
+                }
+            }
+            Err(err) => self.status = err.restore_message().into(),
+        }
+    }
+
+    /// Drop only this reference and its favourite; the original file is untouched.
+    fn remove_local(&mut self) {
+        let Some(index) = self.selected else { return };
+        if self
+            .assets
+            .get(index)
+            .is_none_or(|asset| asset.study.is_some() || asset.source.is_none())
+        {
+            return;
+        }
+        self.assets.remove(index);
+        self.favourites.retain(|&i| i != index);
+        for favourite in &mut self.favourites {
+            if *favourite > index {
+                *favourite -= 1;
+            }
+        }
+        let visible = self.visible();
+        if self.selected.is_none_or(|i| !visible.contains(&i)) {
+            self.selected = visible.first().copied();
+        }
+        if self.persist_local() {
+            self.status = "Removed from library. Your original file is unchanged.".into();
+        }
     }
 
     fn use_prompt(&mut self) {
@@ -323,6 +460,102 @@ impl Studio {
             }
             Err(_) => self.status = "The draft could not be saved to disk.".into(),
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum OriginalError {
+    Missing,
+    Unreadable,
+    TooLarge,
+    Format,
+}
+
+impl OriginalError {
+    fn import_message(self) -> &'static str {
+        match self {
+            Self::Missing => "This file could not be read.",
+            Self::Unreadable => "This file could not be opened.",
+            Self::TooLarge => "Choose an image file no larger than 24 MB.",
+            Self::Format => "Choose a JPEG, PNG or WebP image.",
+        }
+    }
+
+    fn restore_message(self) -> &'static str {
+        match self {
+            Self::Missing => "The original is unavailable.",
+            Self::Unreadable => "The original could not be opened.",
+            Self::TooLarge => "The original is larger than 24 MB.",
+            Self::Format => "The original is not a supported image.",
+        }
+    }
+}
+
+/// The one loader for user images: import, startup, refresh and locate all
+/// apply the same file, size and format guards before touching the cache.
+fn read_original(path: &Path) -> Result<(String, String, Arc<[u8]>), OriginalError> {
+    let meta = path.metadata().map_err(|_| OriginalError::Missing)?;
+    if !meta.is_file() {
+        return Err(OriginalError::Missing);
+    }
+    if meta.len() > MAX_IMPORT {
+        return Err(OriginalError::TooLarge);
+    }
+    let file = File::open(path).map_err(|_| OriginalError::Unreadable)?;
+    let mut data = Vec::new();
+    file.take(MAX_IMPORT + 1)
+        .read_to_end(&mut data)
+        .map_err(|_| OriginalError::Unreadable)?;
+    if data.len() as u64 > MAX_IMPORT {
+        return Err(OriginalError::TooLarge);
+    }
+    let file_type = if data.starts_with(&[0xff, 0xd8, 0xff]) {
+        "jpg"
+    } else if data.starts_with(b"\x89PNG\r\n\x1a\n") {
+        "png"
+    } else if data.starts_with(b"RIFF") && data.get(8..12) == Some(b"WEBP") {
+        "webp"
+    } else {
+        return Err(OriginalError::Format);
+    };
+    let title = path.file_stem().map_or_else(
+        || "Imported image".into(),
+        |stem| stem.to_string_lossy().into_owned(),
+    );
+    let filename = format!("{title}.{file_type}");
+    Ok((title, filename, data.into()))
+}
+
+fn load_original(path: &Path, cache: &ImageCache) -> Result<Print, OriginalError> {
+    let (title, filename, bytes) = read_original(path)?;
+    let image = cache.load(bytes.clone());
+    Ok(Print {
+        title,
+        filename,
+        bytes,
+        image,
+        study: None,
+        source: Some(path.to_path_buf()),
+        available: true,
+    })
+}
+
+/// A missing original stays registered so it can be refreshed, located or removed.
+fn unavailable_print(path: &Path, cache: &ImageCache) -> Print {
+    let title = path.file_stem().map_or_else(
+        || "Saved local image".into(),
+        |stem| stem.to_string_lossy().into_owned(),
+    );
+    let bytes: Arc<[u8]> = Arc::from(Vec::<u8>::new());
+    let image = cache.load(bytes.clone());
+    Print {
+        title,
+        filename: "Original unavailable".into(),
+        bytes,
+        image,
+        study: None,
+        source: Some(path.to_path_buf()),
+        available: false,
     }
 }
 
@@ -477,10 +710,29 @@ fn file_open(_: &mut Studio, tx: &mut Tx) {
     });
 }
 
+/// Explicit recovery for a saved original that moved: the dialog shows the
+/// path because the user asked to locate it; no path enters the UI copy.
+fn locate(_: &mut Studio, tx: &mut Tx) {
+    let options = FileDialogOptions {
+        title: "Locate the original".into(),
+        ..Default::default()
+    }
+    .filter("Images", &["jpg", "jpeg", "png", "webp"]);
+    tx.open_file(options, |s: &mut Studio, answer, _| match answer {
+        Ok(Some(path)) => s.relocate(&path),
+        Ok(None) => (),
+        Err(_) => s.status = "The system could not show the Open dialog.".into(),
+    });
+}
+
 fn export(s: &mut Studio, tx: &mut Tx) {
     let Some(asset) = s.selected.and_then(|i| s.assets.get(i)) else {
         return;
     };
+    if !asset.available {
+        s.status = "The original is unavailable. Refresh or locate it first.".into();
+        return;
+    }
     let filename = asset.filename.clone();
     let bytes = asset.bytes.clone();
     tx.save_file(
@@ -521,7 +773,11 @@ fn write_original(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 
 fn photo(asset: &Print, fit: SurfaceFit, p: Ink) -> El {
     let stage = el().w_full().h_full().fill(p.stage).clip_rounded(10.0);
-    if asset.image.error().is_some() {
+    if !asset.available {
+        stage
+            .center()
+            .child(label("Original unavailable", 12.0, 500.0, p.muted))
+    } else if asset.image.error().is_some() {
         stage.center().child(label(
             "This image could not be opened.",
             14.0,
@@ -647,28 +903,33 @@ fn rail(s: &Studio, p: Ink) -> El {
 
 fn inspector(s: &Studio, asset: &Print, p: Ink) -> El {
     let size = asset
-        .image
-        .intrinsic_size()
+        .available
+        .then(|| asset.image.intrinsic_size())
+        .flatten()
         .map(|[w, h]| format!("{} × {} px", w as u32, h as u32));
-    let dimensions = size.unwrap_or_else(|| asset.filename.clone());
+    let dimensions = size.unwrap_or_else(|| {
+        if asset.available {
+            asset.filename.clone()
+        } else {
+            "Original unavailable".into()
+        }
+    });
     let is_favourite = s.selected.is_some_and(|i| s.favourites.contains(&i));
     let details = col()
         .gap(10.0)
         .child(label("Image details", 12.0, 650.0, p.muted))
         .child(label(&asset.title, 23.0, 640.0, p.primary).wrap());
+    let source = if asset.study.is_some() {
+        "Afterlight · Sample artwork"
+    } else if asset.available {
+        "Local import · Linked original"
+    } else {
+        "Local import · Original unavailable"
+    };
     let mut details = details
         .child(label(dimensions, 12.0, 500.0, p.muted).truncate_middle())
         .child(el().w_full().h(1.0).fill(p.line))
-        .child(label(
-            if asset.study.is_some() {
-                "Afterlight · Sample artwork"
-            } else {
-                "Local import · This session"
-            },
-            12.0,
-            550.0,
-            p.muted,
-        ));
+        .child(label(source, 12.0, 550.0, p.muted));
     if let Some(study) = asset.study {
         details = details
             .child(label("Creative brief", 13.0, 650.0, p.primary))
@@ -680,7 +941,7 @@ fn inspector(s: &Studio, asset: &Print, p: Ink) -> El {
                 .w_full(),
             );
     }
-    col()
+    let mut actions = col()
         .key("inspector")
         .w(252.0)
         .h_full()
@@ -701,16 +962,45 @@ fn inspector(s: &Studio, asset: &Print, p: Ink) -> El {
         )
         .child(action(
             "favourite",
-            match (is_favourite, asset.study.is_some()) {
-                (true, _) => "Remove favourite",
-                (false, true) => "Add to favourites",
-                (false, false) => "Favourite for this session",
+            if is_favourite {
+                "Remove favourite"
+            } else {
+                "Add to favourites"
             },
             p,
             false,
             |s, _| s.favourite(),
-        ))
-        .child(action("export", "Export original", p, true, export))
+        ));
+    if asset.available {
+        actions = actions.child(action("export", "Export original", p, true, export));
+    }
+    if asset.study.is_none() {
+        if !asset.available {
+            actions = actions
+                .child(action(
+                    "refresh-original",
+                    "Refresh original",
+                    p,
+                    false,
+                    |s, _| s.refresh(),
+                ))
+                .child(action(
+                    "locate-original",
+                    "Locate original…",
+                    p,
+                    false,
+                    locate,
+                ));
+        }
+        actions = actions.child(action(
+            "remove-local",
+            "Remove from library",
+            p,
+            false,
+            |s, _| s.remove_local(),
+        ));
+    }
+    actions
 }
 
 fn workspace(s: &Studio, p: Ink) -> El {
@@ -720,7 +1010,7 @@ fn workspace(s: &Studio, p: Ink) -> El {
         Shelf::Favourites => ("Favourites", "The prints you want to return to."),
         Shelf::Imports => (
             "Local imports",
-            "Images opened from this device during this session.",
+            "Your originals, linked from this device and kept between launches.",
         ),
     };
     let header = row()
@@ -785,9 +1075,11 @@ fn workspace(s: &Studio, p: Ink) -> El {
             .child(label(&asset.title, 19.0, 620.0, p.primary).truncate())
             .child(
                 label(
-                    asset
-                        .study
-                        .map_or("Original from this device.", |i| AFTERLIGHT[i].note),
+                    match asset.study {
+                        Some(i) => AFTERLIGHT[i].note,
+                        None if asset.available => "Linked original on this device.",
+                        None => "Original unavailable — refresh or locate it.",
+                    },
                     12.0,
                     450.0,
                     p.muted,

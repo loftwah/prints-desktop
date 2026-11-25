@@ -12,6 +12,7 @@
 use std::fmt;
 use std::io::Read;
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 mod library;
@@ -129,6 +130,7 @@ pub struct OysterClient {
     installation: String,
     key: ApiKey,
     http: Client,
+    root_only: AtomicBool,
 }
 
 impl OysterClient {
@@ -154,6 +156,7 @@ impl OysterClient {
             installation: installation.to_owned(),
             key,
             http,
+            root_only: AtomicBool::new(false),
         })
     }
 
@@ -183,6 +186,11 @@ impl OysterClient {
         serde_json::from_value(value).map_err(|_| Error::Decode)
     }
 
+    /// This connection accepted the root-only library contract.
+    pub fn root_only(&self) -> bool {
+        self.root_only.load(Ordering::Relaxed)
+    }
+
     /// `listOutputs` — requires approved `computer.list`. Pass `folder` as a
     /// relative library path (omit for the root) and `after` from a prior page.
     pub fn list_outputs(
@@ -196,11 +204,15 @@ impl OysterClient {
             return Err(Error::InvalidArgument);
         }
         if let Some(folder) = folder {
-            if !valid_folder(folder) {
+            if self.root_only() || !valid_folder(folder) {
                 return Err(Error::InvalidFolder);
             }
         }
-        let mut input = json!({ "recursive": recursive, "limit": limit });
+        let root_only = self.root_only();
+        let mut input = json!({ "limit": limit });
+        if !root_only {
+            input["recursive"] = json!(recursive);
+        }
         if let Some(folder) = folder {
             input["folder"] = Value::String(folder.to_owned());
         }
@@ -210,8 +222,29 @@ impl OysterClient {
                 "printId": cursor.print_id,
             });
         }
-        let value = self.call("listOutputs", input)?;
-        serde_json::from_value(value).map_err(|_| Error::Decode)
+        let result = self.call("listOutputs", input.clone());
+        if let Err(error) = &result
+            && !root_only
+            && folder.is_none()
+            && (matches!(
+                error,
+                Error::Status {
+                    status: 400 | 502,
+                    ..
+                }
+            ) || matches!(error, Error::Refused { code, .. } if code == "invalid_input"))
+        {
+            // Older Prints rejects the recursive field before running the
+            // read. Confirm the legacy contract with a successful root page.
+            if let Some(object) = input.as_object_mut() {
+                object.remove("recursive");
+            }
+            let page = serde_json::from_value(self.call("listOutputs", input)?)
+                .map_err(|_| Error::Decode)?;
+            self.root_only.store(true, Ordering::Relaxed);
+            return Ok(page);
+        }
+        serde_json::from_value(result?).map_err(|_| Error::Decode)
     }
 
     /// One base64 chunk of an indexed output — requires approved

@@ -21,13 +21,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let key = rpassword::prompt_password("Scoped Prints App key (hidden): ")?;
     let client = OysterClient::new(origin, installation, ApiKey::new(key))?;
-    let catalogue = client.test_connection()?;
     let page = client.list_outputs(None, true, None, 24)?;
-    println!(
-        "Read {} model entries and {} library entries on the first page.",
-        catalogue.models.len(),
-        page.items.len()
-    );
+    let scope = if client.root_only() {
+        "the root library"
+    } else {
+        "the library"
+    };
+    println!("Read {} entries from {scope}.", page.items.len());
+    match client.list_models() {
+        Ok(catalogue) => println!("Read {} model entries.", catalogue.models.len()),
+        Err(error) => eprintln!("Model catalogue unavailable: {error}"),
+    }
     if let Some((print_id, path)) = export {
         let original = client.download_output(print_id)?;
         let mut file = std::fs::File::options()
