@@ -15,7 +15,7 @@ Prints is a native workbench for image makers. Compare a cover and its release p
 | If you want to… | Start here |
 | --- | --- |
 | **See what the UI does** | Open the [creative archive in your browser](https://prints.loftwah.com/#archive). Follow the [native walkthrough](https://prints.loftwah.com/#walkthrough) to compare **Higher Than Before** and export an original. |
-| **Work offline** | Download the preview and import a JPEG, PNG or WebP from your computer. The offline library needs no account, wallet, token, or model credits. |
+| **Work offline** | Download the preview and link up to 12 JPEG, PNG or WebP originals from your computer. The offline library needs no account, wallet, token, or model credits. |
 | **Work with an agent** | Connect an approved client to your Oyster host’s `/mcp` endpoint with a Prints-scoped key. Start with the read-only `execute` example in the [Oyster guide](https://docs.fungi.computer/guides/call-an-app-from-your-own-server). |
 | **Use Shiitake** | Open Shiitake in your project folder and give it the release art brief below. For your first tool call, use your own authorised Fungi Team or Oyster connection. [Shiitake terminal guide](https://docs.fungi.computer/guides/use-the-terminal) |
 | **Build with AI** | Start with one brief and one target size. Create through web Prints, then inspect the resulting file in the desktop app. [Open Prints and choose a prompt](https://prints.loftwah.com/) |
@@ -55,7 +55,7 @@ Get the archives and SHA-256 checksums from the [v0.4.1 release](https://github.
 
 If Gatekeeper blocks the Mac ZIP, build the `v0.4.1` tag with the free Xcode command-line tools and Rust, or try the contact sheet in your browser. A local build needs no Apple Developer Program membership. [Install guide and exact build commands](https://prints.loftwah.com/guide#install)
 
-[Windows desktop verification](https://github.com/loftwah/prints-desktop/issues/7) · [Public download counts](https://prints.loftwah.com/downloads)
+[Windows desktop verification](https://github.com/loftwah/prints-desktop/issues/7) · [Public download counts](https://prints.loftwah.com/downloads) · [v0.4.1 benchmark baseline](docs/preview-benchmark.md)
 
 ## Build or help
 
