@@ -19,8 +19,12 @@ permissions. Confirm the intended Computer in Oyster before connecting. The
 selected Computer and library can change on the host, so integrations must
 recheck that identity before caching or handing off owner assets.
 
-The existing host returned HTTP 401 on the typed library method without a
-scoped App key. An authenticated test against that host remains open.
+The existing Loftwah host accepted a temporary Prints-only key. The desktop
+opened six indexed outputs, exported an original whose bytes matched an
+independent read of the same asset, and confirmed denial after revocation.
+The installed Prints contract accepts root reads and lacks folder discovery.
+Its model catalogue returned HTTP 502. The desktop can open that root library
+and offers web Prints for folder navigation.
 
 - [Issue, specification and live evidence](https://github.com/loftwah/app-composer/issues/1292)
 - [Fungi guide to calling an App with a scoped key](https://docs.fungi.computer/guides/call-an-app-from-your-own-server/)
@@ -64,10 +68,9 @@ slice ends the stream. The desktop preview does not install this diagnostic.
 The typed route and permissions come from
 [Oyster 0.58.9 at 8295ec6](https://github.com/fungi-computer/oyster/blob/8295ec63a32d09734d887b01d7675788a0639fbd/src/host.ts#L2722-L2739)
 and [Prints 0.21.17 at 8482912](https://github.com/fungi-computer/prints/blob/8482912387552cc602d54b0d41ec4271c9cb7f43/backend/methods.ts).
-The first live test needs a known installation and sample asset. Confirm model
-and library access, compare the retrieved bytes against the same owner
-export, then verify denial after key revocation. Test a different installation
-and a moved Computer selection before persisting a connection in the app.
+To verify a new installation, confirm model and library access, compare the
+retrieved bytes against the same original, and verify denial after revocation.
+Check the selected Computer before saving a connection.
 
 Read-only transport tests use an isolated loopback server with fictional
 responses. Run them with:

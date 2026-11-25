@@ -39,6 +39,7 @@ def output(computer="fictional-computer"):
 
 class OysterFixture(BaseHTTPRequestHandler):
     revoke = False
+    legacy = False
 
     def log_message(self, *_):
         pass
@@ -54,7 +55,9 @@ class OysterFixture(BaseHTTPRequestHandler):
         arguments = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         CALLS.append((operation, arguments))
         if operation == "listOutputs":
-            if self.revoke and arguments.get("folder") == "Studies":
+            if self.legacy and "recursive" in arguments:
+                self.reply(502, {"error": "App execution failed"})
+            elif self.revoke and arguments.get("folder") == "Studies":
                 self.reply(200, {"error": "revoked"})
             else:
                 self.reply(200, {"items": [output()], "next": None})
@@ -90,9 +93,12 @@ class OysterFixture(BaseHTTPRequestHandler):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("snapshot", nargs="?", type=Path)
-    parser.add_argument("--revoked", action="store_true")
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--revoked", action="store_true")
+    modes.add_argument("--legacy", action="store_true")
     options = parser.parse_args()
     OysterFixture.revoke = options.revoked
+    OysterFixture.legacy = options.legacy
     with tempfile.TemporaryDirectory(prefix="prints-connection-proof-") as temporary:
         run = Path(temporary)
         with ThreadingHTTPServer(("127.0.0.1", 0), OysterFixture) as server:
@@ -113,6 +119,8 @@ def main():
             ]
             if options.revoked:
                 actions = [entry for entry in actions if entry[0] <= 3.90]
+            elif options.legacy:
+                actions = [entry for entry in actions if entry[0] not in (3.40, 3.90)]
             steps = run / "steps.json"
             steps.write_text(json.dumps([{"t": t, "type": kind, **options} for t, kind, options in actions]))
             tree = run / "tree.json"
@@ -135,7 +143,15 @@ def main():
         assert (run / "export.jpg").read_bytes() == ASSET
         for expected in ("Prints library", "Fixture model", "Style", "Garden keeper", "Original exported"):
             assert expected in contents, expected
-        assert ("listOutputs", {"recursive": True, "limit": 24, "folder": "Studies"}) in CALLS
+        if options.legacy:
+            assert CALLS[:2] == [
+                ("listOutputs", {"recursive": True, "limit": 24}),
+                ("listOutputs", {"limit": 24}),
+            ]
+            assert "This installation exposes its root library" in contents
+            assert 'browse-folders' not in contents
+        else:
+            assert ("listOutputs", {"recursive": True, "limit": 24, "folder": "Studies"}) in CALLS
         assert sum(operation == "getOutput" for operation, _ in CALLS) == 4
         assert any(operation == "openOutput" and request["byteOffset"] > 0 for operation, request in CALLS)
         print("Connected workspace replay passed. Exact original bytes exported from the fictional Oyster fixture.")

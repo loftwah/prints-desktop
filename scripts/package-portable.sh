@@ -2,12 +2,17 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
-platform="${1:?Choose linux-arm64 or windows-x64}"
+platform="${1:?Choose linux-arm64, linux-x64 or windows-x64}"
 binary="${2:?Provide the release binary for the named platform}"
 binary="$(realpath "$binary")"
 case "$platform" in
   linux-arm64)
     file -b "$binary" | grep -q 'ELF.*ARM aarch64'
+    executable="prints-desktop"
+    extension="tar.gz"
+    ;;
+  linux-x64)
+    file -b "$binary" | grep -q 'ELF.*x86-64'
     executable="prints-desktop"
     extension="tar.gz"
     ;;

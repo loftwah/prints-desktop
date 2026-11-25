@@ -791,42 +791,54 @@ pub(super) fn library(s: &Studio, p: Ink) -> El {
                 let _ = tx.open_url(&url);
             },
         ));
-    let filters = row()
-        .w_full()
-        .items_center()
-        .gap(7.0)
-        .child(
-            field(
-                "library-folder",
-                "Library folder",
-                "All folders",
-                &h.folder,
-                p,
-                |s| &mut s.hosted.folder,
-            )
-            .grow(1.0)
-            .min_w(0.0),
+    let filters = if client.root_only() {
+        label(
+            "This installation exposes its root library. Open web Prints to browse folders.",
+            13.0,
+            500.0,
+            p.muted,
         )
-        .child(action("library-apply", "Open folder", p, false, |s, _| {
-            s.hosted.apply_folder()
-        }))
-        .child(action("library-root", "All folders", p, false, |s, _| {
-            s.hosted.folder = TextEdit::new("");
-            s.hosted.apply_folder();
-        }));
+        .wrap()
+    } else {
+        row()
+            .w_full()
+            .items_center()
+            .gap(7.0)
+            .child(
+                field(
+                    "library-folder",
+                    "Library folder",
+                    "All folders",
+                    &h.folder,
+                    p,
+                    |s| &mut s.hosted.folder,
+                )
+                .grow(1.0)
+                .min_w(0.0),
+            )
+            .child(action("library-apply", "Open folder", p, false, |s, _| {
+                s.hosted.apply_folder()
+            }))
+            .child(action("library-root", "All folders", p, false, |s, _| {
+                s.hosted.folder = TextEdit::new("");
+                s.hosted.apply_folder();
+            }))
+    };
     let mut items = col()
         .w_full()
         .gap(5.0)
         .padding(9.0)
         .radius(10.0)
         .fill(p.panel);
-    items = items.child(action(
-        "browse-folders",
-        "Browse folders",
-        p,
-        false,
-        |s, _| s.hosted.browse_folders(None),
-    ));
+    if !client.root_only() {
+        items = items.child(action(
+            "browse-folders",
+            "Browse folders",
+            p,
+            false,
+            |s, _| s.hosted.browse_folders(None),
+        ));
+    }
     if let Some(folders) = &h.folder_options {
         if folders.folders.is_empty() {
             items = items.child(label("No subfolders here.", 13.0, 500.0, p.muted));
