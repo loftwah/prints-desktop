@@ -14,7 +14,7 @@ Install [rustup](https://rustup.rs/). The checkout selects the toolchain in `rus
 | Platform | Prerequisites |
 | --- | --- |
 | Apple Silicon macOS | Xcode command-line tools. The packaged app targets macOS 14 or later. |
-| Debian Linux | Install `libdbus-1-dev`, `libxkbcommon-dev`, and `libwayland-dev` to build. A minimal X11 session also needs `libx11-xcb1`, `libxcursor1`, `libxi6`, and `libxkbcommon-x11-0`. Open and Save use the XDG desktop portal. |
+| Debian Linux | Install `libdbus-1-dev`, `libxkbcommon-dev`, and `libwayland-dev` to build. The portable binary needs `libdbus-1-3`. A minimal X11 session also needs `libx11-xcb1`, `libxcursor1`, `libxi6`, and `libxkbcommon-x11-0`. Open and Save use the XDG desktop portal. |
 | Windows x64 | Visual Studio C++ Build Tools for the MSVC target, or MinGW-w64 for the GNU target. See the release for actual signing and runtime coverage. |
 
 From the repository root, use `cargo run --locked`. On Linux, optional app-menu integration uses the archive’s desktop entry and icon. Put the binary on your PATH, the desktop entry in `~/.local/share/applications`, and its PNG in `~/.local/share/icons/hicolor/512x512/apps`.
