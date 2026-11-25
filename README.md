@@ -78,12 +78,14 @@ version and Git revision in `Contents/Resources/build.txt`.
 - **Linux ARM64 and x64** · Build with `cargo build --locked --release` using Rust 1.99.1.
   On Debian, install `libdbus-1-dev`, `libxkbcommon-dev` and `libwayland-dev` to compile.
   A graphical session needs the X11 or Wayland client libraries and working
-  graphics drivers. Native Open and Save use the XDG desktop portal.
+  graphics drivers. In a minimal Debian X11 session, provide `libx11-xcb1`,
+  `libxcursor1`, `libxi6` and `libxkbcommon-x11-0`. Native Open and Save use
+  the XDG desktop portal.
   Run `scripts/package-portable.sh linux-arm64 target/release/prints-desktop`
   for ARM64 or use `linux-x64` for x64. Portable archives include a desktop
   entry and the Prints icon. For application-menu integration, install the
   binary on your PATH, put the entry in `~/.local/share/applications`, and
-  put its PNG in `~/.local/share/icons/hicolor/1024x1024/apps`.
+  put its PNG in `~/.local/share/icons/hicolor/512x512/apps`.
 - **Windows x64** · Build with Rust and the Visual Studio C++ build tools, or
   use the GNU Rust target and MinGW-w64. To package a native GNU cross-build,
   run `scripts/package-portable.sh windows-x64 target/x86_64-pc-windows-gnu/release/prints-desktop.exe`.
