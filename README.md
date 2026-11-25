@@ -1,10 +1,23 @@
 # Prints Desktop
 
-**Compare the artwork. Keep the original.**
+**Pick the version worth keeping.**
 
-Prints is a native workbench for image makers. Compare a cover and its release poster side by side, shortlist the versions worth keeping, and export the original file byte for byte. Open it offline to explore finished work from LoftwahFM, Fighter, and Bubbles, or bring your own images.
+**TL;DR** · Drop in a few exports or AI variants, compare them side by side and take the exact original with you. Prints works offline without an account. Connect your own Oyster library to browse and export generated work.
 
-[Visit prints.loftwah.com](https://prints.loftwah.com/) · [Preview releases](https://github.com/loftwah/prints-desktop/releases) · [Contribute](CONTRIBUTING.md)
+[Try the browser demo](https://prints.loftwah.com/#afterlight) · [Download the desktop preview](https://github.com/loftwah/prints-desktop/releases/tag/v0.4.2) · [Contribute](CONTRIBUTING.md)
+
+## Quickstarts
+
+- **Desktop.** [Download the matching archive](https://github.com/loftwah/prints-desktop/releases/tag/v0.4.2) and [open Prints](https://prints.loftwah.com/guide#install). In **Creative Archive**, pick **Higher Than Before**, choose **Compare formats**, then return to the contact sheet and choose **Export original**.
+- **Build from GitHub.** Install [Rust with rustup](https://rustup.rs/) and check the [platform prerequisites](CONTRIBUTING.md#platform-setup). Clone the release tag and run the locked build.
+
+  ```sh
+  git clone --branch v0.4.2 --depth 1 https://github.com/loftwah/prints-desktop.git
+  cd prints-desktop
+  cargo run --locked
+  ```
+
+- **Agent.** Connect your approved client to your Oyster host’s `/mcp` endpoint. Use a revocable App key with `apps.read` for the Prints installation and a selected Computer and library folder. Ask the agent to list up to five outputs and report their formats and any available dimensions without downloading them. [Fungi’s read-only example](https://docs.fungi.computer/guides/call-an-app-from-your-own-server) · [Prints connection notes](docs/oyster.md)
 
 ![The native Prints Desktop workspace. The Loftwah Creative Archive shows the Higher Than Before album cover, its contact sheet and original-export control.](docs/screenshots/creative-archive-v0.4.0.webp)
 
@@ -16,7 +29,7 @@ Prints is a native workbench for image makers. Compare a cover and its release p
 | --- | --- |
 | **See what the UI does** | Open the [creative archive in your browser](https://prints.loftwah.com/#archive). Follow the [native walkthrough](https://prints.loftwah.com/#walkthrough) to compare **Higher Than Before** and export an original. |
 | **Work offline** | Download the preview and drop up to 12 JPEG, PNG or WebP originals into the workspace. Choose **Set first image**, select another original and choose **Compare images**. The offline library needs no account, wallet, token, or model credits. |
-| **Work with an agent** | Connect an approved client to your Oyster host’s `/mcp` endpoint with a Prints-scoped key. Start with the read-only `execute` example in the [Oyster guide](https://docs.fungi.computer/guides/call-an-app-from-your-own-server). |
+| **Browse an Oyster library in the app** | Open **Connect Prints** and use a scoped App key for your installation. [Desktop connection steps](docs/oyster.md) |
 | **Use Shiitake** | Open Shiitake in your project folder and give it the release art brief below. For your first tool call, use your own authorised Fungi Team or Oyster connection. [Shiitake terminal guide](https://docs.fungi.computer/guides/use-the-terminal) |
 | **Build with AI** | Start with one brief and one target size. Create through web Prints, then inspect the resulting file in the desktop app. [Open Prints and choose a prompt](https://prints.loftwah.com/) |
 | **Run the stack yourself** | Start with the free local Oyster trial. Add an authorised Workers AI model when you need generation and use AI Gateway when you need to observe supported requests. [Oyster trial](https://docs.fungi.computer/oyster-quickstart) · [Prints on Cloudflare](https://docs.fungi.computer/apps/prints) |
@@ -51,7 +64,7 @@ Get the archives, SHA-256 checksums and platform verification details from the [
 | --- | --- | --- |
 | **Apple Silicon Mac** · macOS 14+ | Extract the ZIP and open `Prints Desktop.app`. [Gatekeeper guidance](https://support.apple.com/en-au/102445) | Ad-hoc signed and unnotarised. See the release for the Mac checks on this build. |
 | **Linux** · x64 or ARM64 | Extract the tarball and run `prints-desktop` in a graphical session. [Runtime prerequisites](CONTRIBUTING.md#platform-setup) | See the release for Debian graphical verification and x64 translation coverage. |
-| **Windows** · x64 | Extract the ZIP and run `prints-desktop.exe`. | Unsigned x64 cross-build. Archive and embedded source checks passed. A Windows desktop launch is unverified. |
+| **Windows** · x64 | Extract the ZIP and open `Prints Desktop.exe`. | Unsigned x64 cross-build. Archive and embedded source checks passed. A Windows desktop launch is unverified. |
 
 If Gatekeeper blocks the Mac ZIP, build the `v0.4.2` tag with the free Xcode command-line tools and Rust, or try the contact sheet in your browser. A local build needs no Apple Developer Program membership. [Install guide and exact build commands](https://prints.loftwah.com/guide#install)
 
