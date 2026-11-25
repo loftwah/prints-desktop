@@ -117,7 +117,7 @@ enum Operation {
     BrowseFolders,
     Transfer(Transfer),
     ChooseDestination,
-    WriteOriginal,
+    WriteOriginal(OriginalWrite),
 }
 
 impl Operation {
@@ -130,7 +130,7 @@ impl Operation {
             Self::Transfer(Transfer::Preview) => "Loading image preview…",
             Self::Transfer(Transfer::Original) => "Fetching original…",
             Self::ChooseDestination => "Choose where to save the original…",
-            Self::WriteOriginal => "Writing original…",
+            Self::WriteOriginal(_) => "Writing original…",
         }
     }
 }
@@ -141,7 +141,6 @@ enum Reply {
     Folders(FolderPage),
     Preview(Vec<u8>),
     Export(Vec<u8>, String),
-    Saved(PathBuf),
     Forgotten,
 }
 
@@ -315,6 +314,12 @@ impl Hosted {
         self.epoch = self.epoch.wrapping_add(1);
     }
 
+    pub(super) fn finish_write(&mut self) {
+        if matches!(self.operation, Some(Operation::WriteOriginal(_))) {
+            self.operation = None;
+        }
+    }
+
     fn forget(&mut self) {
         if self.busy() || self.connected() {
             return;
@@ -458,6 +463,22 @@ fn filename(path: &str) -> String {
 
 pub(super) fn poll(s: &mut Studio, _: f64, tx: &mut Tx) -> bool {
     let h = &mut s.hosted;
+    if let Some(Operation::WriteOriginal(write)) = &h.operation {
+        let Some(result) = write.take() else {
+            return false;
+        };
+        h.operation = None;
+        match result {
+            Ok(path) => {
+                if let Some(library) = &mut h.library {
+                    library.last_export = Some(path);
+                }
+                h.status = "Original exported.".into();
+            }
+            Err(_) => h.status = "Couldn't write the selected file.".into(),
+        }
+        return true;
+    }
     let Some(reply) = h.request.take() else {
         return false;
     };
@@ -522,13 +543,13 @@ pub(super) fn poll(s: &mut Studio, _: f64, tx: &mut Tx) -> bool {
                     }
                     match result {
                         Ok(Some(path)) => {
-                            h.start(Operation::WriteOriginal);
-                            h.request.request((path, bytes), |(path, bytes)| {
-                                write_original(&path, &bytes).map_err(|_| {
-                                    Failure::local("Couldn't write the selected file.")
-                                })?;
-                                Ok(Reply::Saved(path))
-                            });
+                            match OriginalWrite::start(path, bytes.into(), s.wake.clone()) {
+                                Ok(write) => h.start(Operation::WriteOriginal(write)),
+                                Err(_) => {
+                                    h.operation = None;
+                                    h.status = "Couldn't write the selected file.".into();
+                                }
+                            }
                         }
                         Ok(None) => {
                             h.operation = None;
@@ -541,12 +562,6 @@ pub(super) fn poll(s: &mut Studio, _: f64, tx: &mut Tx) -> bool {
                     }
                 },
             );
-        }
-        (Operation::WriteOriginal, Ok(Reply::Saved(path))) => {
-            if let Some(library) = &mut h.library {
-                library.last_export = Some(path);
-            }
-            h.status = "Original exported.".into();
         }
         (Operation::Forget, Ok(Reply::Forgotten)) => {
             h.saved = None;
@@ -965,16 +980,30 @@ pub(super) fn library(s: &Studio, p: Ink) -> El {
     }
     if !h.busy() {
         let mut pagination = row().gap(4.0);
-        if let Some(previous) = library.position.previous() {
-            pagination =
-                pagination.child(action("hosted-prev", "Previous", p, false, move |s, _| {
-                    s.hosted.load_page(previous.clone());
-                }));
+        if library.position.index > 0 {
+            pagination = pagination.child(action("hosted-prev", "Previous", p, false, |s, _| {
+                if let Some(previous) = s
+                    .hosted
+                    .library
+                    .as_ref()
+                    .and_then(|library| library.position.previous())
+                {
+                    s.hosted.load_page(previous);
+                }
+            }));
         }
-        if let Some(cursor) = library.page.next.clone() {
-            let next = library.position.next(cursor);
-            pagination = pagination.child(action("hosted-next", "Next", p, false, move |s, _| {
-                s.hosted.load_page(next.clone());
+        if library.page.next.is_some() {
+            pagination = pagination.child(action("hosted-next", "Next", p, false, |s, _| {
+                let next = s.hosted.library.as_ref().and_then(|library| {
+                    library
+                        .page
+                        .next
+                        .clone()
+                        .map(|cursor| library.position.next(cursor))
+                });
+                if let Some(next) = next {
+                    s.hosted.load_page(next);
+                }
             }));
         }
         items = items.child(pagination);

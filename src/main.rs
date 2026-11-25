@@ -2,12 +2,14 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 mod archive;
 mod comparison;
+mod disk;
+use disk::OriginalWrite;
 mod hosted;
 mod local;
 mod navigation;
@@ -16,7 +18,7 @@ use rune::prefs::Prefs;
 use rune::tok::TextStyle;
 use rune::{
     App, AppSpec, Color, Cursor, Cx, El, FileDialogOptions, Image, ImageCache, Key, KeyEvent,
-    Latest, ScrollSpec, SurfaceFit, TextEdit, Tx, Waker, col, el, row, text, text_input,
+    ScrollSpec, SurfaceFit, TextEdit, Tx, Waker, col, el, row, text, text_input,
 };
 
 const APP_ID: &str = "com.loftwah.prints-desktop";
@@ -208,12 +210,12 @@ impl Search {
     }
 }
 
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Default)]
 enum LocalExport {
     #[default]
     Idle,
     ChooseDestination,
-    WriteOriginal,
+    WriteOriginal(OriginalWrite),
 }
 
 struct Studio {
@@ -231,7 +233,7 @@ struct Studio {
     prefs: Prefs,
     cache: Option<ImageCache>,
     local_export: LocalExport,
-    export_reply: Latest<std::io::Result<()>>,
+    wake: Option<Waker>,
     local_loaded: bool,
     proof: bool,
     hosted: hosted::Hosted,
@@ -284,7 +286,7 @@ impl Studio {
             prefs,
             cache: None,
             local_export: LocalExport::Idle,
-            export_reply: Latest::default(),
+            wake: None,
             local_loaded: false,
             proof,
             hosted,
@@ -293,7 +295,7 @@ impl Studio {
 
     fn load(&mut self, wake: Waker) {
         self.hosted.set_waker(wake.clone());
-        self.export_reply.set_waker(wake.clone());
+        self.wake = Some(wake.clone());
         let cache = ImageCache::new(wake);
         self.assets = AFTERLIGHT
             .iter()
@@ -895,7 +897,7 @@ fn locate(s: &mut Studio, tx: &mut Tx) {
 }
 
 fn export(s: &mut Studio, tx: &mut Tx) {
-    if s.local_export != LocalExport::Idle {
+    if !matches!(s.local_export, LocalExport::Idle) {
         return;
     }
     let Some(asset) = s.selected.and_then(|i| s.assets.get(i)) else {
@@ -916,11 +918,13 @@ fn export(s: &mut Studio, tx: &mut Tx) {
             ..Default::default()
         },
         move |s: &mut Studio, answer, _| match answer {
-            Ok(Some(path)) => {
-                s.local_export = LocalExport::WriteOriginal;
-                s.export_reply
-                    .request((path, bytes), |(path, bytes)| write_original(&path, &bytes));
-            }
+            Ok(Some(path)) => match OriginalWrite::start(path, bytes, s.wake.clone()) {
+                Ok(write) => s.local_export = LocalExport::WriteOriginal(write),
+                Err(_) => {
+                    s.local_export = LocalExport::Idle;
+                    s.status = "The original could not be saved. Try again.".into();
+                }
+            },
             Ok(None) => s.local_export = LocalExport::Idle,
             Err(_) => {
                 s.local_export = LocalExport::Idle;
@@ -932,12 +936,15 @@ fn export(s: &mut Studio, tx: &mut Tx) {
 
 fn poll(s: &mut Studio, time: f64, tx: &mut Tx) -> bool {
     let hosted_updated = hosted::poll(s, time, tx);
-    let Some(result) = s.export_reply.take() else {
+    let LocalExport::WriteOriginal(write) = &s.local_export else {
+        return hosted_updated;
+    };
+    let Some(result) = write.take() else {
         return hosted_updated;
     };
     s.local_export = LocalExport::Idle;
     s.status = match result {
-        Ok(()) => "Original exported.".into(),
+        Ok(_) => "Original exported.".into(),
         Err(_) => "The original could not be saved. Try another folder.".into(),
     };
     true
@@ -949,27 +956,13 @@ fn export_action(s: &Studio, key: &'static str, p: Ink) -> El {
         LocalExport::ChooseDestination => {
             label("Choose where to save the original…", 12.0, 500.0, p.muted).wrap()
         }
-        LocalExport::WriteOriginal => label("Writing original…", 12.0, 500.0, p.muted).wrap(),
+        LocalExport::WriteOriginal(_) => label("Writing original…", 12.0, 500.0, p.muted).wrap(),
     }
 }
 
-fn write_original(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let identifier = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let temporary = path.with_file_name(format!(".prints-{}-{identifier}.tmp", std::process::id()));
-    let mut file = File::options()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)?;
-    let written = file.write_all(bytes).and_then(|_| file.sync_all());
-    drop(file);
-    let installed = written.and_then(|_| std::fs::rename(&temporary, path));
-    if installed.is_err() {
-        let _ = std::fs::remove_file(&temporary);
-    }
-    installed
+fn finish_writes(s: &mut Studio, _: &mut Tx) {
+    s.local_export = LocalExport::Idle;
+    s.hosted.finish_write();
 }
 
 fn photo(asset: &Print, fit: SurfaceFit, p: Ink) -> El {
@@ -1677,6 +1670,8 @@ fn main() {
         scenes: &[("light", |s| s.theme_light = true)],
         ..AppSpec::new("Prints Desktop", (1350.0, 830.0), Studio::new, view)
     })
+    .on_close(finish_writes)
+    .on_quit(finish_writes)
     .chrome(rune::Chrome {
         full_size_content: false,
         ..Default::default()
