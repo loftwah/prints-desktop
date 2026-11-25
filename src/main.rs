@@ -1202,6 +1202,7 @@ fn photo(s: &Studio, asset: &Print, fit: SurfaceFit, p: Ink) -> El {
         s.original(asset).map(|picture| &picture.image),
         asset.available(),
         fit,
+        false,
         p,
     )
 }
@@ -1211,25 +1212,36 @@ fn thumbnail(s: &Studio, asset: &Print, p: Ink) -> El {
         .path()
         .and_then(|path| s.local_images.thumbnail(path))
         .or_else(|| asset.picture().map(|picture| &picture.image));
-    render_photo(image, asset.available(), SurfaceFit::Fill, p)
+    render_photo(image, asset.available(), SurfaceFit::Fill, true, p)
 }
 
-fn render_photo(image: Option<&Image>, available: bool, fit: SurfaceFit, p: Ink) -> El {
+fn render_photo(
+    image: Option<&Image>,
+    available: bool,
+    fit: SurfaceFit,
+    thumbnail: bool,
+    p: Ink,
+) -> El {
     let stage = el().w_full().h_full().fill(p.stage).clip_rounded(10.0);
     if !available {
-        return stage
-            .center()
-            .child(label("Original unavailable", 12.0, 500.0, p.muted));
+        let (message, size) = if thumbnail {
+            ("Missing", 10.0)
+        } else {
+            ("Original unavailable", 12.0)
+        };
+        return stage.center().child(label(message, size, 500.0, p.muted));
     }
     if image.is_some_and(|image| image.error().is_some()) {
-        stage.center().child(label(
-            "This image could not be opened.",
-            14.0,
-            500.0,
-            p.muted,
-        ))
+        let (message, size) = if thumbnail {
+            ("Unreadable", 10.0)
+        } else {
+            ("This image could not be opened.", 14.0)
+        };
+        stage.center().child(label(message, size, 500.0, p.muted))
     } else if let Some(image) = image.filter(|image| image.is_ready()) {
         stage.pixels_fit(image.pixels(), fit)
+    } else if thumbnail {
+        stage
     } else {
         stage
             .center()
