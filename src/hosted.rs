@@ -156,6 +156,12 @@ impl From<Error> for Failure {
             Error::Status { status: 401, .. } => {
                 "The key was refused or revoked. Check your scoped App key.".into()
             }
+            Error::Refused { code, .. } | Error::Status { code: Some(code), .. }
+                if code == "library_unavailable" =>
+            {
+                "Choose a gallery folder in web Prints on the selected Oyster Computer, then reconnect."
+                    .into()
+            }
             Error::Status { status: 403, .. } => {
                 "Oyster refused this action. Check the installation grants and selected Computer."
                     .into()
@@ -630,6 +636,11 @@ pub(super) fn connection(s: &Studio, p: Ink) -> El {
     let title = col().gap(9.0)
         .child(label("Connect your Prints library", 34.0, 650.0, p.primary).wrap())
         .child(label("Open the library on your selected Oyster Computer. Afterlight stays available offline.", 15.0, 450.0, p.muted).wrap());
+    let title = if !h.status.is_empty() || (h.busy() && h.connected()) {
+        title.child(status(h, p))
+    } else {
+        title
+    };
     let mut form = col()
         .w_full()
         .max_w(560.0)
@@ -743,12 +754,9 @@ pub(super) fn connection(s: &Studio, p: Ink) -> El {
             p,
             false,
             |_, tx| {
-                let _ = tx.open_url(
-                    "https://docs.fungi.computer/guides/call-an-app-from-your-own-server/",
-                );
+                let _ = tx.open_url("https://prints.loftwah.com/guide#connect");
             },
         ))
-        .child(status(h, p))
 }
 
 fn asset_detail(h: &Hosted, library: &Library, item: &OutputItem, p: Ink) -> El {

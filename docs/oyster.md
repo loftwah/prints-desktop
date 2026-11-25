@@ -19,6 +19,11 @@ permissions. Confirm the intended Computer in Oyster before connecting. The
 selected Computer and library can change on the host, so integrations must
 recheck that identity before caching or handing off owner assets.
 
+If Prints asks for a gallery folder, sign in to Oyster in your browser and
+open web Prints. Choose the intended Computer and gallery folder there, then
+return to Prints Desktop and reconnect. A fresh local Oyster trial needs
+this setup before the desktop can list its library.
+
 The existing Loftwah host accepted a temporary Prints-only key. The desktop
 opened six indexed outputs, exported an original whose bytes matched an
 independent read of the same asset, and confirmed denial after revocation.
@@ -92,5 +97,5 @@ followed by an authorised live test for price, dispatch, retained output and
 same-request recovery. Cloudflare infrastructure, Workers AI and external
 inference have separate usage and billing.
 
-- [Oyster's named-key authentication](https://github.com/fungi-computer/oyster/blob/8295ec63a32d09734d887b01d7675788a0639fbd/src/auth.ts#L256-L276)
-- [Prints generation admission](https://github.com/fungi-computer/prints/blob/8482912387552cc602d54b0d41ec4271c9cb7f43/backend/methods.ts#L1060-L1067)
+- [Oyster's named-key authentication](https://github.com/fungi-computer/oyster/blob/3784e3071f10af40f2d179220e954da536b585d7/src/auth.ts#L256-L276)
+- [Prints generation admission](https://github.com/fungi-computer/prints/blob/3475e6e4075fa858a908d58eeb9a67595bd1f373/backend/methods.ts#L1060-L1067)
