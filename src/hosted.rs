@@ -22,6 +22,119 @@ struct Connection {
     stored: Result<bool, String>,
 }
 
+#[derive(Clone)]
+struct PagePosition {
+    folder: Option<String>,
+    cursors: Vec<Option<PageCursor>>,
+    index: usize,
+}
+
+impl PagePosition {
+    fn first(folder: Option<String>) -> Self {
+        Self {
+            folder,
+            cursors: vec![None],
+            index: 0,
+        }
+    }
+
+    fn previous(&self) -> Option<Self> {
+        Some(Self {
+            index: self.index.checked_sub(1)?,
+            ..self.clone()
+        })
+    }
+
+    fn next(&self, cursor: PageCursor) -> Self {
+        let mut cursors = self.cursors[..=self.index].to_vec();
+        cursors.push(Some(cursor));
+        Self {
+            folder: self.folder.clone(),
+            cursors,
+            index: self.index + 1,
+        }
+    }
+}
+
+struct Library {
+    client: Arc<OysterClient>,
+    models: Result<Vec<Model>, Error>,
+    position: PagePosition,
+    folders: Option<FolderPage>,
+    page: OutputPage,
+    selected: Option<usize>,
+    preview: Option<Image>,
+    last_export: Option<PathBuf>,
+}
+
+impl Library {
+    fn new(client: Arc<OysterClient>, models: Result<Vec<Model>, Error>, page: OutputPage) -> Self {
+        let selected = (!page.items.is_empty()).then_some(0);
+        Self {
+            client,
+            models,
+            position: PagePosition::first(None),
+            folders: None,
+            page,
+            selected,
+            preview: None,
+            last_export: None,
+        }
+    }
+
+    fn show(&mut self, page: OutputPage, position: PagePosition) {
+        self.folders = None;
+        self.selected = (!page.items.is_empty()).then_some(0);
+        self.preview = None;
+        self.page = page;
+        self.position = position;
+    }
+
+    fn selected(&self) -> Option<&OutputItem> {
+        self.page.items.get(self.selected?)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Transfer {
+    Preview,
+    Original,
+}
+
+impl Transfer {
+    fn limit(self) -> u64 {
+        match self {
+            Self::Preview => PREVIEW_BYTES,
+            Self::Original => EXPORT_BYTES,
+        }
+    }
+}
+
+enum Operation {
+    Connect,
+    Forget,
+    LoadPage(PagePosition),
+    BrowseFolders,
+    Transfer(Transfer),
+    ChooseDestination,
+    WriteOriginal,
+}
+
+impl Operation {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Connect => "Connecting to Oyster…",
+            Self::Forget => "Removing saved key…",
+            Self::LoadPage(_) => "Loading library…",
+            Self::BrowseFolders => "Loading folders…",
+            Self::Transfer(Transfer::Preview) => "Loading image preview…",
+            Self::Transfer(Transfer::Original) => "Fetching original…",
+            Self::ChooseDestination => "Choose where to save the original…",
+            Self::WriteOriginal => "Writing original…",
+        }
+    }
+}
+
 enum Reply {
     Connected(Connection),
     Page(OutputPage),
@@ -79,18 +192,9 @@ pub(super) struct Hosted {
     key: TextEdit,
     remember: bool,
     saved: Option<Profile>,
-    client: Option<Arc<OysterClient>>,
-    models: Result<Vec<Model>, Error>,
+    library: Option<Library>,
     folder: TextEdit,
-    active_folder: Option<String>,
-    folder_options: Option<FolderPage>,
-    page: Option<OutputPage>,
-    cursors: Vec<Option<PageCursor>>,
-    page_index: usize,
-    selected: Option<usize>,
-    preview: Option<Image>,
-    last_export: Option<PathBuf>,
-    pending: &'static str,
+    operation: Option<Operation>,
     status: String,
     epoch: u64,
     request: Latest<Result<Reply, Failure>>,
@@ -108,18 +212,9 @@ impl Hosted {
             key: TextEdit::new("").secure(),
             remember: false,
             saved,
-            client: None,
-            models: Ok(Vec::new()),
+            library: None,
             folder: TextEdit::new(""),
-            active_folder: None,
-            folder_options: None,
-            page: None,
-            cursors: vec![None],
-            page_index: 0,
-            selected: None,
-            preview: None,
-            last_export: None,
-            pending: "",
+            operation: None,
             status: String::new(),
             epoch: 0,
             request: Latest::default(),
@@ -131,16 +226,20 @@ impl Hosted {
     }
 
     pub(super) fn connected(&self) -> bool {
-        self.client.is_some()
+        self.library.is_some()
     }
 
-    fn wait(&mut self, label: &'static str) {
-        self.pending = label;
+    fn busy(&self) -> bool {
+        self.operation.is_some()
+    }
+
+    fn start(&mut self, operation: Operation) {
+        self.operation = Some(operation);
         self.status.clear();
     }
 
     fn connect(&mut self, saved: bool) {
-        if !self.pending.is_empty() || self.connected() {
+        if self.busy() || self.connected() {
             return;
         }
         let profile = if saved {
@@ -158,7 +257,7 @@ impl Hosted {
         let remember = self.remember && !saved;
         let saved_profile = self.saved.clone();
         self.key = TextEdit::new("").secure();
-        self.wait("Connecting to Oyster…");
+        self.start(Operation::Connect);
         self.request
             .request((profile, key), move |((origin, installation), entered)| {
                 let key = if saved {
@@ -208,31 +307,22 @@ impl Hosted {
 
     fn disconnect(&mut self) {
         self.request.cancel();
-        self.client = None;
-        self.models = Ok(Vec::new());
-        self.page = None;
-        self.selected = None;
-        self.preview = None;
-        self.last_export = None;
+        self.library = None;
         self.folder = TextEdit::new("");
-        self.active_folder = None;
-        self.folder_options = None;
-        self.cursors = vec![None];
-        self.page_index = 0;
         self.key = TextEdit::new("").secure();
-        self.pending = "";
+        self.operation = None;
         self.status.clear();
         self.epoch = self.epoch.wrapping_add(1);
     }
 
     fn forget(&mut self) {
-        if !self.pending.is_empty() || self.connected() {
+        if self.busy() || self.connected() {
             return;
         }
         let Some(profile) = self.saved.clone() else {
             return;
         };
-        self.wait("Removing saved key…");
+        self.start(Operation::Forget);
         self.request.request(profile, |profile| {
             match credential(&profile)?.delete_credential() {
                 Ok(()) | Err(keyring::Error::NoEntry) => Ok(Reply::Forgotten),
@@ -243,29 +333,17 @@ impl Hosted {
         });
     }
 
-    fn load_page(
-        &mut self,
-        folder: Option<String>,
-        index: usize,
-        cursors: Vec<Option<PageCursor>>,
-    ) {
-        if !self.pending.is_empty() {
+    fn load_page(&mut self, position: PagePosition) {
+        if self.busy() {
             return;
         }
-        let Some(client) = self.client.clone() else {
+        let Some(library) = &self.library else {
             return;
         };
-        let Some(cursor) = cursors.get(index).cloned() else {
-            return;
-        };
-        self.wait("Loading library…");
-        self.active_folder = folder.clone();
-        self.folder_options = None;
-        self.page = None;
-        self.selected = None;
-        self.preview = None;
-        self.cursors = cursors;
-        self.page_index = index;
+        let client = library.client.clone();
+        let cursor = position.cursors[position.index].clone();
+        let folder = position.folder.clone();
+        self.start(Operation::LoadPage(position));
         self.request
             .request((client, folder, cursor), |(client, folder, cursor)| {
                 Ok(Reply::Page(client.list_outputs(
@@ -278,14 +356,15 @@ impl Hosted {
     }
 
     fn browse_folders(&mut self, after: Option<u64>) {
-        if !self.pending.is_empty() {
+        if self.busy() {
             return;
         }
-        let Some(client) = self.client.clone() else {
+        let Some(library) = &self.library else {
             return;
         };
-        let folder = self.active_folder.clone();
-        self.wait("Loading folders…");
+        let client = library.client.clone();
+        let folder = library.position.folder.clone();
+        self.start(Operation::BrowseFolders);
         self.request
             .request((client, folder), move |(client, folder)| {
                 Ok(Reply::Folders(
@@ -297,29 +376,31 @@ impl Hosted {
     fn apply_folder(&mut self) {
         let folder = self.folder.text.trim();
         let folder = (!folder.is_empty()).then(|| folder.to_owned());
-        self.load_page(folder, 0, vec![None]);
+        self.load_page(PagePosition::first(folder));
     }
 
     fn select(&mut self, index: usize) {
-        if self.pending.is_empty() {
-            self.selected = Some(index);
-            self.preview = None;
+        if !self.busy()
+            && let Some(library) = &mut self.library
+            && index < library.page.items.len()
+        {
+            library.selected = Some(index);
+            library.preview = None;
             self.status.clear();
         }
     }
 
-    fn selected(&self) -> Option<&OutputItem> {
-        self.page.as_ref()?.items.get(self.selected?)
-    }
-
-    fn transfer(&mut self, preview: bool) {
-        if !self.pending.is_empty() {
+    fn transfer(&mut self, transfer: Transfer) {
+        if self.busy() {
             return;
         }
-        let (Some(client), Some(item)) = (self.client.clone(), self.selected().cloned()) else {
+        let Some(library) = &self.library else {
             return;
         };
-        let limit = if preview { PREVIEW_BYTES } else { EXPORT_BYTES };
+        let Some(item) = library.selected().cloned() else {
+            return;
+        };
+        let limit = transfer.limit();
         if item.print.bytes > limit {
             self.status = format!(
                 "This original exceeds the {} MiB limit.",
@@ -327,30 +408,18 @@ impl Hosted {
             );
             return;
         }
-        self.wait(if preview {
-            "Loading image preview…"
-        } else {
-            "Fetching original…"
-        });
+        let client = library.client.clone();
+        self.start(Operation::Transfer(transfer));
         self.request.request((client, item), move |(client, item)| {
             let bytes = client.verify_and_download(&item)?;
-            if preview && !previewable(&bytes) {
-                return Err(Failure::local(
+            match transfer {
+                Transfer::Preview if !previewable(&bytes) => Err(Failure::local(
                     "This image format can be exported or opened in web Prints.",
-                ));
-            }
-            if preview {
-                Ok(Reply::Preview(bytes))
-            } else {
-                Ok(Reply::Export(bytes, filename(&item.path)))
+                )),
+                Transfer::Preview => Ok(Reply::Preview(bytes)),
+                Transfer::Original => Ok(Reply::Export(bytes, filename(&item.path))),
             }
         });
-    }
-
-    fn accept_page(&mut self, page: OutputPage) {
-        self.selected = (!page.items.is_empty()).then_some(0);
-        self.page = Some(page);
-        self.preview = None;
     }
 }
 
@@ -392,9 +461,11 @@ pub(super) fn poll(s: &mut Studio, _: f64, tx: &mut Tx) -> bool {
     let Some(reply) = h.request.take() else {
         return false;
     };
-    h.pending = "";
-    match reply {
-        Ok(Reply::Connected(connection)) => {
+    let Some(operation) = h.operation.take() else {
+        return false;
+    };
+    match (operation, reply) {
+        (Operation::Connect, Ok(Reply::Connected(connection))) => {
             let profile = connection.client.identity();
             h.origin = TextEdit::new(&profile.0);
             h.installation = TextEdit::new(&profile.1);
@@ -408,20 +479,33 @@ pub(super) fn poll(s: &mut Studio, _: f64, tx: &mut Tx) -> bool {
                 Ok(false) => {}
                 Err(message) => h.status = message,
             }
-            h.client = Some(connection.client);
-            h.models = connection.models;
-            h.accept_page(connection.page);
-            s.screen = Screen::Hosted;
-            tx.blur();
-        }
-        Ok(Reply::Page(page)) => h.accept_page(page),
-        Ok(Reply::Folders(folders)) => h.folder_options = Some(folders),
-        Ok(Reply::Preview(bytes)) => {
-            if let Some(cache) = &s.cache {
-                h.preview = Some(cache.load(Arc::<[u8]>::from(bytes)));
+            h.library = Some(Library::new(
+                connection.client,
+                connection.models,
+                connection.page,
+            ));
+            if s.screen == Screen::Connection {
+                s.screen = Screen::Hosted;
+                tx.blur();
             }
         }
-        Ok(Reply::Export(bytes, name)) => {
+        (Operation::LoadPage(position), Ok(Reply::Page(page))) => {
+            if let Some(library) = &mut h.library {
+                library.show(page, position);
+            }
+        }
+        (Operation::BrowseFolders, Ok(Reply::Folders(folders))) => {
+            if let Some(library) = &mut h.library {
+                library.folders = Some(folders);
+            }
+        }
+        (Operation::Transfer(Transfer::Preview), Ok(Reply::Preview(bytes))) => {
+            if let (Some(library), Some(cache)) = (&mut h.library, &s.cache) {
+                library.preview = Some(cache.load(Arc::<[u8]>::from(bytes)));
+            }
+        }
+        (Operation::Transfer(Transfer::Original), Ok(Reply::Export(bytes, name))) => {
+            h.start(Operation::ChooseDestination);
             let epoch = h.epoch;
             tx.save_file(
                 FileDialogOptions {
@@ -431,12 +515,14 @@ pub(super) fn poll(s: &mut Studio, _: f64, tx: &mut Tx) -> bool {
                 },
                 move |s: &mut Studio, result, _| {
                     let h = &mut s.hosted;
-                    if h.epoch != epoch || !h.connected() {
+                    if h.epoch != epoch
+                        || !matches!(h.operation, Some(Operation::ChooseDestination))
+                    {
                         return;
                     }
                     match result {
                         Ok(Some(path)) => {
-                            h.wait("Writing original…");
+                            h.start(Operation::WriteOriginal);
                             h.request.request((path, bytes), |(path, bytes)| {
                                 write_original(&path, &bytes).map_err(|_| {
                                     Failure::local("Couldn't write the selected file.")
@@ -444,17 +530,25 @@ pub(super) fn poll(s: &mut Studio, _: f64, tx: &mut Tx) -> bool {
                                 Ok(Reply::Saved(path))
                             });
                         }
-                        Ok(None) => h.status = "Export cancelled.".into(),
-                        Err(_) => h.status = "Couldn't open the Save dialog.".into(),
+                        Ok(None) => {
+                            h.operation = None;
+                            h.status = "Export cancelled.".into();
+                        }
+                        Err(_) => {
+                            h.operation = None;
+                            h.status = "Couldn't open the Save dialog.".into();
+                        }
                     }
                 },
             );
         }
-        Ok(Reply::Saved(path)) => {
-            h.last_export = Some(path);
+        (Operation::WriteOriginal, Ok(Reply::Saved(path))) => {
+            if let Some(library) = &mut h.library {
+                library.last_export = Some(path);
+            }
             h.status = "Original exported.".into();
         }
-        Ok(Reply::Forgotten) => {
+        (Operation::Forget, Ok(Reply::Forgotten)) => {
             h.saved = None;
             h.status = if s.prefs.remove(PROFILE).is_ok() {
                 "Saved key removed from this device.".into()
@@ -462,13 +556,20 @@ pub(super) fn poll(s: &mut Studio, _: f64, tx: &mut Tx) -> bool {
                 "The key was removed. The app couldn't clear the saved connection label.".into()
             };
         }
-        Err(error) => {
+        (operation, Err(error)) => {
             if error.unauthorized && h.connected() {
                 h.disconnect();
-                s.screen = Screen::Connection;
+                if s.screen == Screen::Hosted {
+                    s.screen = Screen::Connection;
+                    tx.blur();
+                }
             }
             h.status = error.message;
+            if matches!(operation, Operation::LoadPage(_)) && h.connected() {
+                h.status.push_str(" Showing the previous view.");
+            }
         }
+        _ => h.status = "The library operation did not finish as expected. Try again.".into(),
     }
     true
 }
@@ -502,10 +603,9 @@ fn field(
 }
 
 fn status(h: &Hosted, p: Ink) -> El {
-    let message = if h.pending.is_empty() {
-        &h.status
-    } else {
-        h.pending
+    let message: &str = match &h.operation {
+        Some(operation) => operation.label(),
+        None => &h.status,
     };
     label(message, 13.0, 500.0, p.accent).wrap()
 }
@@ -523,8 +623,8 @@ pub(super) fn connection(s: &Studio, p: Ink) -> El {
         .radius(12.0)
         .fill(p.panel)
         .border(1.0, p.line);
-    if h.connected() {
-        let client = h.client.as_ref().expect("connected client");
+    if let Some(library) = &h.library {
+        let client = &library.client;
         form = form
             .child(label(client.identity().0, 14.0, 600.0, p.primary).wrap())
             .child(action("open-hosted", "Open library", p, true, |s, _| {
@@ -537,7 +637,7 @@ pub(super) fn connection(s: &Studio, p: Ink) -> El {
                 false,
                 |s, _| s.hosted.disconnect(),
             ));
-    } else if !h.pending.is_empty() {
+    } else if h.busy() {
         form = form.child(status(h, p));
     } else {
         form = form
@@ -636,7 +736,7 @@ pub(super) fn connection(s: &Studio, p: Ink) -> El {
         .child(status(h, p))
 }
 
-fn asset_detail(h: &Hosted, item: &OutputItem, p: Ink) -> El {
+fn asset_detail(h: &Hosted, library: &Library, item: &OutputItem, p: Ink) -> El {
     let dimensions = match (item.print.width, item.print.height) {
         (Some(width), Some(height)) => format!("{width} × {height}"),
         _ => item
@@ -664,20 +764,23 @@ fn asset_detail(h: &Hosted, item: &OutputItem, p: Ink) -> El {
             .wrap(),
         )
         .child(label(&item.print.model, 13.0, 500.0, p.muted).wrap());
-    if h.pending.is_empty() {
+    if !h.busy() {
         let mut buttons = row().gap(7.0);
         if item.print.bytes <= EXPORT_BYTES {
             buttons = buttons.child(action("hosted-save", "Export original", p, true, |s, _| {
-                s.hosted.transfer(false)
+                s.hosted.transfer(Transfer::Original)
             }));
         }
-        if item.print.kind == "image" && item.print.bytes <= PREVIEW_BYTES && h.preview.is_none() {
+        if item.print.kind == "image"
+            && item.print.bytes <= PREVIEW_BYTES
+            && library.preview.is_none()
+        {
             buttons = buttons.child(action(
                 "hosted-preview",
                 "Load image preview",
                 p,
                 false,
-                |s, _| s.hosted.transfer(true),
+                |s, _| s.hosted.transfer(Transfer::Preview),
             ));
         }
         if let Some(typed) = &item.typed {
@@ -695,7 +798,7 @@ fn asset_detail(h: &Hosted, item: &OutputItem, p: Ink) -> El {
         }
         detail = detail.child(buttons);
     }
-    if let Some(image) = &h.preview {
+    if let Some(image) = &library.preview {
         let mut panel = el().w_full().h(280.0).fill(p.stage).clip_rounded(9.0);
         panel = if image.is_ready() {
             panel.pixels_fit(image.pixels(), SurfaceFit::Fit)
@@ -745,10 +848,11 @@ fn asset_detail(h: &Hosted, item: &OutputItem, p: Ink) -> El {
 
 pub(super) fn library(s: &Studio, p: Ink) -> El {
     let h = &s.hosted;
-    let Some(client) = &h.client else {
+    let Some(library) = &h.library else {
         return connection(s, p);
     };
-    let (_, installation) = client.identity();
+    let client = &library.client;
+    let (origin, installation) = client.identity();
     let url = client.app_url();
     let title = row()
         .w_full()
@@ -759,15 +863,7 @@ pub(super) fn library(s: &Studio, p: Ink) -> El {
                 .grow(1.0)
                 .gap(3.0)
                 .child(label("Prints library", 34.0, 650.0, p.primary).wrap())
-                .child(
-                    label(
-                        format!("{} · {installation}", client.identity().0),
-                        13.0,
-                        500.0,
-                        p.muted,
-                    )
-                    .wrap(),
-                ),
+                .child(label(format!("{origin} · {installation}"), 13.0, 500.0, p.muted).wrap()),
         )
         .child(action(
             "open-web-prints",
@@ -826,7 +922,7 @@ pub(super) fn library(s: &Studio, p: Ink) -> El {
             |s, _| s.hosted.browse_folders(None),
         ));
     }
-    if let Some(folders) = &h.folder_options {
+    if let Some(folders) = &library.folders {
         if folders.folders.is_empty() {
             items = items.child(label("No subfolders here.", 13.0, 500.0, p.muted));
         }
@@ -853,41 +949,39 @@ pub(super) fn library(s: &Studio, p: Ink) -> El {
             ));
         }
     }
-    if let Some(page) = &h.page {
-        if page.items.is_empty() {
-            items = items
-                .child(label("This folder has no indexed prints.", 13.0, 500.0, p.muted).wrap());
-        }
-        for (index, item) in page.items.iter().enumerate() {
-            let name = filename(&item.path);
-            items = items.child(nav(
-                &format!("hosted-item-{index}"),
-                &name,
-                h.selected == Some(index),
-                p,
-                move |s, _| s.hosted.select(index),
-            ));
-        }
+    if library.page.items.is_empty() {
+        items =
+            items.child(label("This folder has no indexed prints.", 13.0, 500.0, p.muted).wrap());
+    }
+    for (index, item) in library.page.items.iter().enumerate() {
+        let name = filename(&item.path);
+        items = items.child(nav(
+            &format!("hosted-item-{index}"),
+            &name,
+            library.selected == Some(index),
+            p,
+            move |s, _| s.hosted.select(index),
+        ));
+    }
+    if !h.busy() {
         let mut pagination = row().gap(4.0);
-        if h.page_index > 0 {
-            pagination = pagination.child(action("hosted-prev", "Previous", p, false, |s, _| {
-                let h = &mut s.hosted;
-                h.load_page(h.active_folder.clone(), h.page_index - 1, h.cursors.clone());
-            }));
+        if let Some(previous) = library.position.previous() {
+            pagination =
+                pagination.child(action("hosted-prev", "Previous", p, false, move |s, _| {
+                    s.hosted.load_page(previous.clone());
+                }));
         }
-        if let Some(cursor) = page.next.clone() {
+        if let Some(cursor) = library.page.next.clone() {
+            let next = library.position.next(cursor);
             pagination = pagination.child(action("hosted-next", "Next", p, false, move |s, _| {
-                let h = &mut s.hosted;
-                let mut cursors = h.cursors[..=h.page_index].to_vec();
-                cursors.push(Some(cursor.clone()));
-                h.load_page(h.active_folder.clone(), h.page_index + 1, cursors);
+                s.hosted.load_page(next.clone());
             }));
         }
         items = items.child(pagination);
     }
     let mut detail = col().w_full().min_w(0.0).gap(12.0);
-    if let Some(item) = h.selected() {
-        detail = detail.child(asset_detail(h, item, p));
+    if let Some(item) = library.selected() {
+        detail = detail.child(asset_detail(h, library, item, p));
     }
     let mut catalogue = col()
         .w_full()
@@ -895,7 +989,7 @@ pub(super) fn library(s: &Studio, p: Ink) -> El {
         .padding(12.0)
         .radius(8.0)
         .fill(p.panel);
-    match &h.models {
+    match &library.models {
         Ok(models) => {
             catalogue = catalogue.child(label(
                 format!("Available models · {}", models.len()),
@@ -924,7 +1018,7 @@ pub(super) fn library(s: &Studio, p: Ink) -> El {
     }
     detail = detail.child(catalogue);
     let mut feedback = row().gap(10.0).items_center().child(status(h, p));
-    if let Some(path) = &h.last_export {
+    if let Some(path) = &library.last_export {
         let path = path.clone();
         feedback = feedback.child(action(
             "hosted-reveal",

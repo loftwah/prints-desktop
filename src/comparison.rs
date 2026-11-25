@@ -1,11 +1,14 @@
 use rune::{El, SurfaceFit, col, el, row};
 
-use crate::{AFTERLIGHT, Ink, Print, Screen, Studio, action, label, photo};
+use crate::{Ink, Print, Screen, Studio, action, label, photo};
 
-const CAMPAIGN_PRINTS: [usize; 2] = [AFTERLIGHT.len(), AFTERLIGHT.len() + 1];
+const CAMPAIGN_PRINTS: [&str; 2] = ["higher-than-before.jpg", "higher-than-before-poster.jpg"];
 
 pub(crate) fn applies(s: &Studio) -> bool {
-    s.selected.is_some_and(|i| CAMPAIGN_PRINTS.contains(&i))
+    s.selected
+        .and_then(|i| s.assets.get(i))
+        .and_then(Print::edition)
+        .is_some_and(|edition| CAMPAIGN_PRINTS.contains(&edition.filename))
 }
 
 fn panel(asset: &Print, format: &str, p: Ink) -> El {
@@ -24,6 +27,28 @@ fn panel(asset: &Print, format: &str, p: Ink) -> El {
 }
 
 pub(crate) fn view(s: &Studio, p: Ink) -> El {
+    let editions = CAMPAIGN_PRINTS.map(|name| {
+        s.assets.iter().find(|asset| {
+            asset
+                .edition()
+                .is_some_and(|edition| edition.filename == name)
+        })
+    });
+    let panels = match editions {
+        [Some(cover), Some(poster)] => row()
+            .w_full()
+            .grow(1.0)
+            .shrink()
+            .gap(15.0)
+            .child(panel(cover, "Album cover", p))
+            .child(panel(poster, "Release poster", p)),
+        _ => label(
+            "The comparison formats are unavailable.",
+            14.0,
+            500.0,
+            p.muted,
+        ),
+    };
     col()
         .key("campaign-comparison")
         .w_full()
@@ -52,13 +77,5 @@ pub(crate) fn view(s: &Studio, p: Ink) -> El {
                     tx.blur();
                 })),
         )
-        .child(
-            row()
-                .w_full()
-                .grow(1.0)
-                .shrink()
-                .gap(15.0)
-                .child(panel(&s.assets[CAMPAIGN_PRINTS[0]], "Album cover", p))
-                .child(panel(&s.assets[CAMPAIGN_PRINTS[1]], "Release poster", p)),
-        )
+        .child(panels)
 }
