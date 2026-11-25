@@ -21,7 +21,7 @@ def replay(run, actions):
     ]))
     subprocess.run(
         [str(BINARY), "--script", str(steps), "--tree", str(tree), "--at", str(actions[-1][0] + 0.5),
-         "--size", "1010x690", "--settle"],
+         "--size", "1010x690", "--settle", "--realtime"],
         check=True, timeout=15,
         env={**os.environ, "PRINTS_REPLAY_PREFS": str(run / "prefs.json")},
     )
@@ -50,17 +50,22 @@ with TemporaryDirectory(prefix="prints-local-library-") as temporary:
     ]), "Select Aurora")
     assert destination.read_bytes() == ORIGINAL
 
-    moved = run / "Aurora moved.jpg"
+    moved = run / "Evening.jpg"
     original.rename(moved)
     missing = replay(run, [(0.2, "tap", {"key": "imports"})])
     text_in(missing, "Locate original")
     text_in(missing, "Remove favourite")
 
-    text_in(replay(run, [
+    relocated = replay(run, [
         (0.2, "tap", {"key": "imports"}),
-        (0.5, "tap", {"key": "locate-original"}),
-        (0.8, "file-dialog", {"path": str(moved)}),
-    ]), "Original located.")
+        (0.4, "tap", {"key": "search-input"}),
+        (0.6, "type", {"text": "aurora"}),
+        (0.8, "tap", {"key": "locate-original"}),
+        (1.0, "file-dialog", {"path": str(moved)}),
+    ])
+    text_in(relocated, "Original located.")
+    assert "Open full view of Evening" not in json.dumps(relocated)
+    assert "Export original" not in json.dumps(relocated)
 
     text_in(replay(run, [
         (0.2, "tap", {"key": "imports"}),
@@ -68,6 +73,6 @@ with TemporaryDirectory(prefix="prints-local-library-") as temporary:
     ]), "Removed from library.")
     assert moved.read_bytes() == ORIGINAL
     no_items = replay(run, [(0.2, "tap", {"key": "favourites"})])
-    assert "Select Aurora" not in json.dumps(no_items)
+    assert "Select Evening" not in json.dumps(no_items)
 
 print("Local library replay passed across restarts. Relocation and removal preserved the original.")

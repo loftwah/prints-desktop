@@ -2,12 +2,14 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 mod archive;
 mod comparison;
+mod disk;
+use disk::OriginalWrite;
 mod hosted;
 mod local;
 mod navigation;
@@ -93,46 +95,127 @@ enum Screen {
     Hosted,
 }
 
+struct Picture {
+    bytes: Arc<[u8]>,
+    image: Image,
+}
+
+impl Picture {
+    fn new(bytes: Arc<[u8]>, cache: &ImageCache) -> Self {
+        Self {
+            image: cache.load(bytes.clone()),
+            bytes,
+        }
+    }
+}
+
+enum Original {
+    Afterlight(&'static Study, Picture),
+    Edition(&'static archive::Edition, Picture),
+    Linked {
+        path: PathBuf,
+        picture: Option<Picture>,
+    },
+}
+
 struct Print {
     title: String,
     filename: String,
-    bytes: Arc<[u8]>,
-    image: Image,
-    study: Option<usize>,
-    edition: Option<&'static archive::Edition>,
-    // Canonical path to the user's original, never a copy kept by the app.
-    source: Option<PathBuf>,
-    // A saved original may be missing for a while; keep the reference so it can return.
-    available: bool,
+    find: String,
+    original: Original,
 }
 
-/// Case-insensitive multiword search over a print's title and filename, plus the
-/// bundled note and prompt when it is an Afterlight study.
-fn matches_search(asset: &Print, query: &str) -> bool {
-    let mut fields = vec![asset.title.as_str(), asset.filename.as_str()];
-    if let Some(study) = asset.study {
-        fields.push(AFTERLIGHT[study].note);
-        fields.push(AFTERLIGHT[study].prompt);
+impl Print {
+    fn new(title: String, filename: String, original: Original) -> Self {
+        let mut fields = vec![title.as_str(), filename.as_str()];
+        match &original {
+            Original::Afterlight(study, _) => fields.extend([study.note, study.prompt]),
+            Original::Edition(edition, _) => fields.extend([edition.note, edition.source]),
+            Original::Linked { .. } => (),
+        }
+        let find = fields.join("\n").to_lowercase();
+        Self {
+            title,
+            filename,
+            find,
+            original,
+        }
     }
-    if let Some(edition) = asset.edition {
-        fields.push(edition.note);
-        fields.push(edition.source);
+
+    fn study(&self) -> Option<&'static Study> {
+        match self.original {
+            Original::Afterlight(study, _) => Some(study),
+            _ => None,
+        }
     }
-    matches_terms(&fields, query)
+
+    fn edition(&self) -> Option<&'static archive::Edition> {
+        match self.original {
+            Original::Edition(edition, _) => Some(edition),
+            _ => None,
+        }
+    }
+
+    fn path(&self) -> Option<&Path> {
+        match &self.original {
+            Original::Linked { path, .. } => Some(path),
+            _ => None,
+        }
+    }
+
+    fn picture(&self) -> Option<&Picture> {
+        match &self.original {
+            Original::Afterlight(_, picture) | Original::Edition(_, picture) => Some(picture),
+            Original::Linked { picture, .. } => picture.as_ref(),
+        }
+    }
+
+    fn caption(&self) -> &'static str {
+        match &self.original {
+            Original::Afterlight(study, _) => study.note,
+            Original::Edition(edition, _) => edition.source,
+            Original::Linked {
+                picture: Some(_), ..
+            } => "Linked original on this device.",
+            Original::Linked { picture: None, .. } => {
+                "Original unavailable — refresh or locate it."
+            }
+        }
+    }
 }
 
-/// Every word must appear somewhere in the fields, in any order and casing.
-fn matches_terms(fields: &[&str], query: &str) -> bool {
-    let query = query.trim().to_lowercase();
-    if query.is_empty() {
-        return true;
+#[derive(Default)]
+struct Search {
+    input: TextEdit,
+    words: Vec<String>,
+}
+
+impl Search {
+    fn update(&mut self) {
+        self.words = self
+            .input
+            .text
+            .split_whitespace()
+            .map(str::to_lowercase)
+            .collect();
     }
-    let haystack = fields
-        .iter()
-        .map(|field| field.to_lowercase())
-        .collect::<Vec<_>>()
-        .join("\n");
-    query.split_whitespace().all(|term| haystack.contains(term))
+
+    fn clear(&mut self) {
+        self.input.clear();
+        self.words.clear();
+    }
+
+    fn includes(&self, normalized: &str) -> bool {
+        self.words.iter().all(|word| normalized.contains(word))
+    }
+}
+
+#[derive(Default)]
+enum LocalExport {
+    #[default]
+    Idle,
+    ChooseDestination,
+    WriteOriginal(OriginalWrite),
 }
 
 struct Studio {
@@ -145,10 +228,12 @@ struct Studio {
     inspector: bool,
     draft: TextEdit,
     draft_dirty: bool,
-    search: TextEdit,
+    search: Search,
     status: String,
     prefs: Prefs,
     cache: Option<ImageCache>,
+    local_export: LocalExport,
+    wake: Option<Waker>,
     local_loaded: bool,
     proof: bool,
     hosted: hosted::Hosted,
@@ -196,10 +281,12 @@ impl Studio {
             inspector: true,
             draft,
             draft_dirty: false,
-            search: TextEdit::default(),
+            search: Search::default(),
             status: String::new(),
             prefs,
             cache: None,
+            local_export: LocalExport::Idle,
+            wake: None,
             local_loaded: false,
             proof,
             hosted,
@@ -208,41 +295,28 @@ impl Studio {
 
     fn load(&mut self, wake: Waker) {
         self.hosted.set_waker(wake.clone());
+        self.wake = Some(wake.clone());
         let cache = ImageCache::new(wake);
         self.assets = AFTERLIGHT
             .iter()
-            .enumerate()
-            .map(|(index, study)| {
-                let bytes: Arc<[u8]> = study.bytes.into();
-                let image = cache.load(bytes.clone());
-                Print {
-                    title: study.title.into(),
-                    filename: study.filename.into(),
-                    bytes,
-                    image,
-                    study: Some(index),
-                    edition: None,
-                    source: None,
-                    available: true,
-                }
+            .map(|study| {
+                Print::new(
+                    study.title.into(),
+                    study.filename.into(),
+                    Original::Afterlight(study, Picture::new(study.bytes.into(), &cache)),
+                )
             })
             .collect();
         self.assets.extend(archive::EDITIONS.iter().map(|edition| {
-            let bytes: Arc<[u8]> = edition.bytes.into();
-            Print {
-                title: edition.title.into(),
-                filename: edition.filename.into(),
-                image: cache.load(bytes.clone()),
-                bytes,
-                study: None,
-                edition: Some(edition),
-                source: None,
-                available: true,
-            }
+            Print::new(
+                edition.title.into(),
+                edition.filename.into(),
+                Original::Edition(edition, Picture::new(edition.bytes.into(), &cache)),
+            )
         }));
         if self.proof {
-            for asset in &self.assets {
-                let _ = asset.image.wait();
+            for picture in self.assets.iter().filter_map(Print::picture) {
+                let _ = picture.image.wait();
             }
         }
         self.cache = Some(cache);
@@ -261,19 +335,18 @@ impl Studio {
                 self.favourites.push(self.assets.len());
             }
             let print = load_original(&record.path, cache)
-                .unwrap_or_else(|_| unavailable_print(&record.path, cache));
-            if self.proof && print.available {
-                let _ = print.image.wait();
+                .unwrap_or_else(|_| unavailable_print(&record.path));
+            if self.proof
+                && let Some(picture) = print.picture()
+            {
+                let _ = picture.image.wait();
             }
             self.assets.push(print);
         }
     }
 
-    fn refs(&self) -> Vec<PathBuf> {
-        self.assets
-            .iter()
-            .filter_map(|asset| asset.source.clone())
-            .collect()
+    fn refs(&self) -> impl Iterator<Item = &Path> {
+        self.assets.iter().filter_map(Print::path)
     }
 
     fn persist_local(&mut self) -> bool {
@@ -283,7 +356,7 @@ impl Studio {
             .enumerate()
             .filter_map(|(index, asset)| {
                 Some(local::Reference {
-                    path: asset.source.clone()?,
+                    path: asset.path()?.to_path_buf(),
                     favourite: self.favourites.contains(&index),
                 })
             })
@@ -302,21 +375,20 @@ impl Studio {
             .enumerate()
             .filter_map(|(i, item)| {
                 let on_shelf = match self.shelf {
-                    Shelf::Archive => item.edition.is_some(),
-                    Shelf::Samples => item.study.is_some(),
+                    Shelf::Archive => item.edition().is_some(),
+                    Shelf::Samples => item.study().is_some(),
                     Shelf::Favourites => self.favourites.contains(&i),
-                    Shelf::Imports => item.source.is_some(),
+                    Shelf::Imports => item.path().is_some(),
                 };
-                (on_shelf && matches_search(item, &self.search.text)).then_some(i)
+                (on_shelf && self.search.includes(&item.find)).then_some(i)
             })
             .collect()
     }
 
     fn searching(&self) -> bool {
-        !self.search.text.trim().is_empty()
+        !self.search.words.is_empty()
     }
 
-    /// Keep a valid selection for what the shelf and the find field currently show.
     fn sync_selection(&mut self) {
         let visible = self.visible();
         if self.selected.is_none_or(|i| !visible.contains(&i)) {
@@ -325,6 +397,7 @@ impl Studio {
     }
 
     fn search_changed(&mut self, tx: &mut Tx) {
+        self.search.update();
         self.sync_selection();
         self.status.clear();
         self.reveal_selection(tx);
@@ -332,7 +405,9 @@ impl Studio {
 
     fn focus_search(&mut self, tx: &mut Tx) {
         self.screen = Screen::Workspace;
-        self.search.set_selection(0, self.search.text.len());
+        self.search
+            .input
+            .set_selection(0, self.search.input.text.len());
         tx.focus("search-input", true);
     }
 
@@ -392,11 +467,11 @@ impl Studio {
             } else {
                 "Favourites could not be saved to disk.".into()
             };
-        } else if self.assets[i].edition.is_some() {
+        } else if self.assets[i].edition().is_some() {
             let archive_favourites: Vec<&str> = self
                 .favourites
                 .iter()
-                .filter_map(|&i| self.assets[i].edition.map(|edition| edition.filename))
+                .filter_map(|&i| self.assets[i].edition().map(|edition| edition.filename))
                 .collect();
             self.status = if self
                 .prefs
@@ -430,11 +505,11 @@ impl Studio {
         let Some(cache) = &self.cache else {
             return Err("The library is starting. Try again in a moment.");
         };
-        if self.refs().len() >= local::MAX_REFS {
+        if self.refs().count() >= local::MAX_REFS {
             return Err("This library already holds 12 local images.");
         }
         let source = local::canonical(path).ok_or("This file could not be read.")?;
-        if self.refs().contains(&source) {
+        if self.refs().any(|path| path == source) {
             return Err("That image is already in your local library.");
         }
         let print = load_original(&source, cache).map_err(OriginalError::import_message)?;
@@ -448,23 +523,17 @@ impl Studio {
     /// Re-read the stored path, so an original that returns is recovered.
     fn refresh(&mut self) {
         let Some(index) = self.selected else { return };
-        if self
-            .assets
-            .get(index)
-            .is_none_or(|asset| asset.source.is_none())
-        {
-            return;
-        }
-        let Some(path) = self.assets[index].source.clone() else {
+        let Some(path) = self.assets.get(index).and_then(Print::path) else {
             return;
         };
         let Some(cache) = &self.cache else {
             self.status = "The library is starting. Try again in a moment.".into();
             return;
         };
-        match load_original(&path, cache) {
+        match load_original(path, cache) {
             Ok(print) => {
                 self.assets[index] = print;
+                self.sync_selection();
                 self.status = "Original refreshed.".into();
             }
             Err(err) => self.status = err.restore_message().into(),
@@ -476,7 +545,7 @@ impl Studio {
         let Some(index) = self
             .assets
             .iter()
-            .position(|asset| asset.source.as_deref() == Some(previous))
+            .position(|asset| asset.path() == Some(previous))
         else {
             self.status = "That entry is no longer in the local library.".into();
             return;
@@ -488,14 +557,12 @@ impl Studio {
                 return;
             }
         };
-        let others: Vec<PathBuf> = self
+        let duplicate = self
             .assets
             .iter()
             .enumerate()
-            .filter(|&(i, _)| i != index)
-            .filter_map(|(_, asset)| asset.source.clone())
-            .collect();
-        if others.contains(&source) {
+            .any(|(i, asset)| i != index && asset.path() == Some(source.as_path()));
+        if duplicate {
             self.status = "That image is already in your local library.".into();
             return;
         }
@@ -506,6 +573,7 @@ impl Studio {
         match load_original(&source, cache) {
             Ok(print) => {
                 self.assets[index] = print;
+                self.sync_selection();
                 if self.persist_local() {
                     self.status = "Original located.".into();
                 }
@@ -517,11 +585,7 @@ impl Studio {
     /// Drop only this reference and its favourite; the original file is untouched.
     fn remove_local(&mut self) {
         let Some(index) = self.selected else { return };
-        if self
-            .assets
-            .get(index)
-            .is_none_or(|asset| asset.source.is_none())
-        {
+        if self.assets.get(index).and_then(Print::path).is_none() {
             return;
         }
         self.assets.remove(index);
@@ -531,10 +595,7 @@ impl Studio {
                 *favourite -= 1;
             }
         }
-        let visible = self.visible();
-        if self.selected.is_none_or(|i| !visible.contains(&i)) {
-            self.selected = visible.first().copied();
-        }
+        self.sync_selection();
         if self.persist_local() {
             self.status = "Removed from library. Your original file is unchanged.".into();
         }
@@ -544,12 +605,12 @@ impl Studio {
         let Some(study) = self
             .selected
             .and_then(|i| self.assets.get(i))
-            .and_then(|a| a.study)
+            .and_then(Print::study)
         else {
             return;
         };
         if self.draft.text.trim().is_empty() {
-            self.draft = TextEdit::new(AFTERLIGHT[study].prompt);
+            self.draft = TextEdit::new(study.prompt);
             self.draft_dirty = true;
             self.status.clear();
         } else {
@@ -611,7 +672,7 @@ fn read_original(path: &Path) -> Result<(String, String, Arc<[u8]>), OriginalErr
         return Err(OriginalError::TooLarge);
     }
     let file = File::open(path).map_err(|_| OriginalError::Unreadable)?;
-    let mut data = Vec::new();
+    let mut data = Vec::with_capacity(meta.len() as usize);
     file.take(MAX_IMPORT + 1)
         .read_to_end(&mut data)
         .map_err(|_| OriginalError::Unreadable)?;
@@ -637,37 +698,29 @@ fn read_original(path: &Path) -> Result<(String, String, Arc<[u8]>), OriginalErr
 
 fn load_original(path: &Path, cache: &ImageCache) -> Result<Print, OriginalError> {
     let (title, filename, bytes) = read_original(path)?;
-    let image = cache.load(bytes.clone());
-    Ok(Print {
+    Ok(Print::new(
         title,
         filename,
-        bytes,
-        image,
-        study: None,
-        edition: None,
-        source: Some(path.to_path_buf()),
-        available: true,
-    })
+        Original::Linked {
+            path: path.to_path_buf(),
+            picture: Some(Picture::new(bytes, cache)),
+        },
+    ))
 }
 
-/// A missing original stays registered so it can be refreshed, located or removed.
-fn unavailable_print(path: &Path, cache: &ImageCache) -> Print {
+fn unavailable_print(path: &Path) -> Print {
     let title = path.file_stem().map_or_else(
         || "Saved local image".into(),
         |stem| stem.to_string_lossy().into_owned(),
     );
-    let bytes: Arc<[u8]> = Arc::from(Vec::<u8>::new());
-    let image = cache.load(bytes.clone());
-    Print {
+    Print::new(
         title,
-        filename: "Original unavailable".into(),
-        bytes,
-        image,
-        study: None,
-        edition: None,
-        source: Some(path.to_path_buf()),
-        available: false,
-    }
+        "Original unavailable".into(),
+        Original::Linked {
+            path: path.to_path_buf(),
+            picture: None,
+        },
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -826,7 +879,8 @@ fn locate(s: &mut Studio, tx: &mut Tx) {
     let Some(previous) = s
         .selected
         .and_then(|i| s.assets.get(i))
-        .and_then(|asset| asset.source.clone())
+        .and_then(Print::path)
+        .map(Path::to_path_buf)
     else {
         return;
     };
@@ -843,15 +897,20 @@ fn locate(s: &mut Studio, tx: &mut Tx) {
 }
 
 fn export(s: &mut Studio, tx: &mut Tx) {
+    if !matches!(s.local_export, LocalExport::Idle) {
+        return;
+    }
     let Some(asset) = s.selected.and_then(|i| s.assets.get(i)) else {
         return;
     };
-    if !asset.available {
+    let Some(picture) = asset.picture() else {
         s.status = "The original is unavailable. Refresh or locate it first.".into();
         return;
-    }
+    };
     let filename = asset.filename.clone();
-    let bytes = asset.bytes.clone();
+    let bytes = picture.bytes.clone();
+    s.local_export = LocalExport::ChooseDestination;
+    s.status.clear();
     tx.save_file(
         FileDialogOptions {
             title: "Export original".into(),
@@ -859,50 +918,69 @@ fn export(s: &mut Studio, tx: &mut Tx) {
             ..Default::default()
         },
         move |s: &mut Studio, answer, _| match answer {
-            Ok(Some(path)) => match write_original(&path, &bytes) {
-                Ok(()) => s.status = "Original exported.".into(),
-                Err(_) => s.status = "The original could not be saved. Try another folder.".into(),
+            Ok(Some(path)) => match OriginalWrite::start(path, bytes, s.wake.clone()) {
+                Ok(write) => s.local_export = LocalExport::WriteOriginal(write),
+                Err(_) => {
+                    s.local_export = LocalExport::Idle;
+                    s.status = "The original could not be saved. Try again.".into();
+                }
             },
-            Ok(None) => (),
-            Err(_) => s.status = "The system could not show the Save dialog.".into(),
+            Ok(None) => s.local_export = LocalExport::Idle,
+            Err(_) => {
+                s.local_export = LocalExport::Idle;
+                s.status = "The system could not show the Save dialog.".into();
+            }
         },
     );
 }
 
-fn write_original(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let identifier = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let temporary = path.with_file_name(format!(".prints-{}-{identifier}.tmp", std::process::id()));
-    let mut file = File::options()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)?;
-    let written = file.write_all(bytes).and_then(|_| file.sync_all());
-    drop(file);
-    let installed = written.and_then(|_| std::fs::rename(&temporary, path));
-    if installed.is_err() {
-        let _ = std::fs::remove_file(&temporary);
+fn poll(s: &mut Studio, time: f64, tx: &mut Tx) -> bool {
+    let hosted_updated = hosted::poll(s, time, tx);
+    let LocalExport::WriteOriginal(write) = &s.local_export else {
+        return hosted_updated;
+    };
+    let Some(result) = write.take() else {
+        return hosted_updated;
+    };
+    s.local_export = LocalExport::Idle;
+    s.status = match result {
+        Ok(_) => "Original exported.".into(),
+        Err(_) => "The original could not be saved. Try another folder.".into(),
+    };
+    true
+}
+
+fn export_action(s: &Studio, key: &'static str, p: Ink) -> El {
+    match s.local_export {
+        LocalExport::Idle => action(key, "Export original", p, true, export),
+        LocalExport::ChooseDestination => {
+            label("Choose where to save the original…", 12.0, 500.0, p.muted).wrap()
+        }
+        LocalExport::WriteOriginal(_) => label("Writing original…", 12.0, 500.0, p.muted).wrap(),
     }
-    installed
+}
+
+fn finish_writes(s: &mut Studio, _: &mut Tx) {
+    s.local_export = LocalExport::Idle;
+    s.hosted.finish_write();
 }
 
 fn photo(asset: &Print, fit: SurfaceFit, p: Ink) -> El {
     let stage = el().w_full().h_full().fill(p.stage).clip_rounded(10.0);
-    if !asset.available {
-        stage
+    let Some(picture) = asset.picture() else {
+        return stage
             .center()
-            .child(label("Original unavailable", 12.0, 500.0, p.muted))
-    } else if asset.image.error().is_some() {
+            .child(label("Original unavailable", 12.0, 500.0, p.muted));
+    };
+    if picture.image.error().is_some() {
         stage.center().child(label(
             "This image could not be opened.",
             14.0,
             500.0,
             p.muted,
         ))
-    } else if asset.image.is_ready() {
-        stage.pixels_fit(asset.image.pixels(), fit)
+    } else if picture.image.is_ready() {
+        stage.pixels_fit(picture.image.pixels(), fit)
     } else {
         stage
             .center()
@@ -1027,12 +1105,11 @@ fn rail(s: &Studio, p: Ink) -> El {
 
 fn inspector(s: &Studio, asset: &Print, p: Ink) -> El {
     let size = asset
-        .available
-        .then(|| asset.image.intrinsic_size())
-        .flatten()
+        .picture()
+        .and_then(|picture| picture.image.intrinsic_size())
         .map(|[w, h]| format!("{} × {} px", w as u32, h as u32));
     let dimensions = size.unwrap_or_else(|| {
-        if asset.available {
+        if asset.picture().is_some() {
             asset.filename.clone()
         } else {
             "Original unavailable".into()
@@ -1043,11 +1120,11 @@ fn inspector(s: &Studio, asset: &Print, p: Ink) -> El {
         .gap(10.0)
         .child(label("Image details", 12.0, 650.0, p.muted))
         .child(label(&asset.title, 23.0, 640.0, p.primary).wrap());
-    let source = if let Some(edition) = asset.edition {
+    let source = if let Some(edition) = asset.edition() {
         edition.source
-    } else if asset.study.is_some() {
+    } else if asset.study().is_some() {
         "Afterlight · Sample artwork"
-    } else if asset.available {
+    } else if asset.picture().is_some() {
         "Local import · Linked original"
     } else {
         "Local import · Original unavailable"
@@ -1056,10 +1133,10 @@ fn inspector(s: &Studio, asset: &Print, p: Ink) -> El {
         .child(label(dimensions, 12.0, 500.0, p.muted).truncate_middle())
         .child(el().w_full().h(1.0).fill(p.line))
         .child(label(source, 12.0, 550.0, p.muted));
-    if let Some(study) = asset.study {
+    if let Some(study) = asset.study() {
         details = details
             .child(label("Creative brief", 13.0, 650.0, p.primary))
-            .child(label(AFTERLIGHT[study].prompt, 13.0, 450.0, p.muted).wrap())
+            .child(label(study.prompt, 13.0, 450.0, p.muted).wrap())
             .child(
                 action("use-prompt", "Use in draft", p, false, |s, _| {
                     s.use_prompt()
@@ -1067,7 +1144,7 @@ fn inspector(s: &Studio, asset: &Print, p: Ink) -> El {
                 .w_full(),
             );
     }
-    if let Some(edition) = asset.edition {
+    if let Some(edition) = asset.edition() {
         details = details
             .child(label(edition.note, 13.0, 450.0, p.muted).wrap())
             .child(
@@ -1113,11 +1190,11 @@ fn inspector(s: &Studio, asset: &Print, p: Ink) -> El {
             false,
             |s, _| s.favourite(),
         ));
-    if asset.available {
-        actions = actions.child(action("export", "Export original", p, true, export));
+    if asset.picture().is_some() {
+        actions = actions.child(export_action(s, "export", p));
     }
-    if asset.source.is_some() {
-        if !asset.available {
+    if asset.path().is_some() {
+        if asset.picture().is_none() {
             actions = actions
                 .child(action(
                     "refresh-original",
@@ -1192,7 +1269,7 @@ fn workspace(s: &Studio, p: Ink) -> El {
         .gap(8.0)
         .child(label("Find", 11.0, 650.0, p.muted))
         .child(
-            text_input(&s.search, TextStyle::new(13.0, 450.0))
+            text_input(&s.search.input, TextStyle::new(13.0, 450.0))
                 .key("search-input")
                 .label("Find in this shelf")
                 .single_line()
@@ -1205,7 +1282,7 @@ fn workspace(s: &Studio, p: Ink) -> El {
                 .focus_ring(2.0, 2.0, p.accent)
                 .color(p.primary)
                 .placeholder("Title, note or filename", p.muted)
-                .on_edit(|s: &mut Studio| &mut s.search)
+                .on_edit(|s: &mut Studio| &mut s.search.input)
                 .on_input_key(|s: &mut Studio, event: &KeyEvent, tx: &mut Tx| {
                     if event.key != Key::Escape {
                         return false;
@@ -1233,7 +1310,7 @@ fn workspace(s: &Studio, p: Ink) -> El {
                 format!(
                     "No prints in {} match “{}”. Clear the find field to see the shelf.",
                     title,
-                    s.search.text.trim()
+                    s.search.input.text.trim()
                 )
             } else {
                 match s.shelf {
@@ -1278,20 +1355,7 @@ fn workspace(s: &Studio, p: Ink) -> El {
             .min_w(0.0)
             .gap(3.0)
             .child(label(&asset.title, 19.0, 620.0, p.primary).truncate())
-            .child(
-                label(
-                    match (asset.study, asset.edition) {
-                        (Some(i), _) => AFTERLIGHT[i].note,
-                        (_, Some(edition)) => edition.source,
-                        _ if asset.available => "Linked original on this device.",
-                        _ => "Original unavailable — refresh or locate it.",
-                    },
-                    12.0,
-                    450.0,
-                    p.muted,
-                )
-                .truncate(),
-            ),
+            .child(label(asset.caption(), 12.0, 450.0, p.muted).truncate()),
     );
     if comparison::applies(s) {
         caption = caption.child(action(
@@ -1321,11 +1385,13 @@ fn workspace(s: &Studio, p: Ink) -> El {
         ));
     let mut strip = row().key("contact-sheet").w_full().gap(7.0);
     for &i in &visible {
+        let width = if visible.len() == 1 { 170.0 } else { f32::MAX };
         let tile = &s.assets[i];
         let chosen = s.selected == Some(i);
         strip = strip.child(
             col()
                 .key(format!("print-{i}"))
+                .max_w(width)
                 .grow(1.0)
                 .shrink()
                 .min_w(72.0)
@@ -1460,7 +1526,7 @@ fn fullscreen(s: &Studio, p: Ink) -> El {
                     )
                     .grow(1.0),
                 )
-                .child(action("export-preview", "Export original", p, true, export)),
+                .child(export_action(s, "export-preview", p)),
         )
 }
 
@@ -1495,10 +1561,8 @@ fn drafting(s: &Studio, p: Ink) -> El {
                 .color(p.primary)
                 .wrap()
                 .placeholder("Describe the image you want to make…", p.muted)
-                .on_edit(|s: &mut Studio| {
-                    s.draft_dirty = true;
-                    &mut s.draft
-                }),
+                .on_edit(|s: &mut Studio| &mut s.draft)
+                .on_input_change(|s: &mut Studio, _| s.draft_dirty = true),
         )
         .child(
             row()
@@ -1601,11 +1665,13 @@ fn main() {
     let app = App::new(AppSpec {
         min_size: Some((940.0, 660.0)),
         setup: Some(Studio::load),
-        poll: Some(hosted::poll),
+        poll: Some(poll),
         on_key: Some(keyboard),
         scenes: &[("light", |s| s.theme_light = true)],
         ..AppSpec::new("Prints Desktop", (1350.0, 830.0), Studio::new, view)
     })
+    .on_close(finish_writes)
+    .on_quit(finish_writes)
     .chrome(rune::Chrome {
         full_size_content: false,
         ..Default::default()
@@ -1618,7 +1684,16 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::matches_terms;
+    use super::{Search, TextEdit};
+
+    fn matches_terms(fields: &[&str], query: &str) -> bool {
+        let mut search = Search {
+            input: TextEdit::new(query),
+            ..Search::default()
+        };
+        search.update();
+        search.includes(&fields.join("\n").to_lowercase())
+    }
 
     #[test]
     fn search_ignores_case_and_matches_every_word_across_fields() {

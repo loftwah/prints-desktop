@@ -21,7 +21,7 @@ def replay(run, actions, present, absent=()):
     tree = run / "tree.json"
     subprocess.run(
         [str(BINARY), "--script", str(script), "--tree", str(tree),
-         "--at", str(0.4 + len(actions) * 0.25), "--size", "940x660", "--settle"],
+         "--at", str(0.4 + len(actions) * 0.25), "--size", "940x660", "--settle", "--realtime"],
         check=True, timeout=15,
         env={**os.environ, "PRINTS_REPLAY_PREFS": str(run / "prefs.json")},
     )

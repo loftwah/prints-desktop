@@ -33,7 +33,7 @@ steps = [
 PY
 binary="${CARGO_TARGET_DIR:-target}/debug/prints-desktop"
 if [ -f "$binary.exe" ]; then binary="$binary.exe"; fi
-"$binary" --script "$scratch/steps.json" --tree "$scratch/tree.json" --at 3.8 --size 1010x690 --settle
+"$binary" --script "$scratch/steps.json" --tree "$scratch/tree.json" --at 3.8 --size 1010x690 --settle --realtime
 cmp assets/salt.jpg "$scratch/export.jpg"
 python3 - "$scratch/tree.json" <<'PY'
 from pathlib import Path
