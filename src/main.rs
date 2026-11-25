@@ -258,6 +258,12 @@ impl Studio {
         }
     }
 
+    fn reveal_selection(&self, tx: &mut Tx) {
+        if let Some(index) = self.selected {
+            tx.scroll_into_view_in("contact-sheet", format!("print-{index}"));
+        }
+    }
+
     fn step(&mut self, direction: isize) {
         let list = self.visible();
         if list.is_empty() {
@@ -699,12 +705,11 @@ fn file_open(_: &mut Studio, tx: &mut Tx) {
         ..Default::default()
     }
     .filter("Images", &["jpg", "jpeg", "png", "webp"]);
-    tx.open_file(options, |s: &mut Studio, answer, _| match answer {
-        Ok(Some(path)) => {
-            if let Err(err) = s.import(&path) {
-                s.status = err.into();
-            }
-        }
+    tx.open_file(options, |s: &mut Studio, answer, tx| match answer {
+        Ok(Some(path)) => match s.import(&path) {
+            Ok(()) => s.reveal_selection(tx),
+            Err(err) => s.status = err.into(),
+        },
         Ok(None) => (),
         Err(_) => s.status = "The system could not show the Open dialog.".into(),
     });
@@ -1327,12 +1332,14 @@ fn view(s: &Studio, _: &mut Cx<Studio>) -> El {
         Screen::Hosted => shell = shell.child(hosted::library(s, p)),
         Screen::Preview => unreachable!(),
     }
-    shell.on_drop_files(|s: &mut Studio, paths, _| {
+    shell.on_drop_files(|s: &mut Studio, paths, tx| {
         if s.screen == Screen::Workspace
             && let Some(path) = paths.first()
-            && let Err(err) = s.import(path)
         {
-            s.status = err.into();
+            match s.import(path) {
+                Ok(()) => s.reveal_selection(tx),
+                Err(err) => s.status = err.into(),
+            }
         }
     })
 }
@@ -1348,8 +1355,12 @@ fn keyboard(s: &mut Studio, event: &KeyEvent, tx: &mut Tx) -> bool {
         Key::Command('s') if matches!(s.screen, Screen::Workspace | Screen::Preview) => {
             export(s, tx)
         }
-        Key::Left if matches!(s.screen, Screen::Workspace | Screen::Preview) => s.step(-1),
-        Key::Right if matches!(s.screen, Screen::Workspace | Screen::Preview) => s.step(1),
+        Key::Left | Key::Right if matches!(s.screen, Screen::Workspace | Screen::Preview) => {
+            s.step(if event.key == Key::Left { -1 } else { 1 });
+            if s.screen == Screen::Workspace {
+                s.reveal_selection(tx);
+            }
+        }
         Key::Enter
             if s.screen == Screen::Workspace && s.selected.is_some() && tx.focused().is_none() =>
         {
