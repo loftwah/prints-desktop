@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Prints Desktop
+Comment=Browse, compare and keep original artwork
+Exec=prints-desktop
+Icon=com.loftwah.prints-desktop
+Terminal=false
+Categories=Graphics;Photography;

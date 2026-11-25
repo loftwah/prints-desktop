@@ -1,10 +1,17 @@
 # Prints Desktop
 
-Open **Afterlight**, six studies in the light that lingers. Browse the contact
-sheet, see a print at full size, keep favourites, and export the included
-JPEGs. Bring an image from your own machine or use a sample's prompt as a
-starting point for an editable, local draft. Sample favourites, saved drafts,
-local imports and their favourites reopen on this device.
+Open the **Loftwah Creative Archive** to browse published work from
+LoftwahFM, Fighter and Bubbles. See the original release formats side by side,
+read each piece’s provenance, or keep a favourite and export its exact original
+bytes. The [archive credit](assets/archive/README.md) identifies every source.
+**Afterlight** retains the six studies from the original collection, with
+creative briefs you can copy into an editable local draft.
+
+Use **Find** or Command/Ctrl+F to filter the current shelf. Escape clears
+Find and returns focus to the workspace. Arrow keys step through the shelf,
+and Enter opens full view. On macOS the File, Edit, Library, View and Help
+menus provide the same workspace commands. Archive and Afterlight favourites,
+local imports and their favourites, and saved drafts reopen on this device.
 
 Local imports keep links to up to 12 original files. The first time you open
 Local imports or Favourites, Prints reads those files from their saved
@@ -20,14 +27,15 @@ ecosystem.
 
 ## Download
 
-Open the [preview release](https://github.com/loftwah/prints-desktop/releases/tag/v0.3.1)
+Open the [preview release](https://github.com/loftwah/prints-desktop/releases)
 for platform details and SHA-256 checksums. On Apple Silicon, extract the ZIP
 and open `Prints Desktop.app`. The preview uses an ad-hoc signature and is
 unnotarised. Check the checksum before installing. See [Apple's Gatekeeper
 guidance](https://support.apple.com/en-au/102445) for the prompts macOS may
 show for a downloaded preview.
 
-See the [App Composer showcase and walkthrough](https://composer.loftwah.com/prints-desktop).
+Start at [prints.loftwah.com](https://prints.loftwah.com/) or visit the
+[App Composer showcase](https://composer.loftwah.com/prints-desktop).
 
 ## Build and inspect
 
@@ -72,7 +80,10 @@ version and Git revision in `Contents/Resources/build.txt`.
   A graphical session needs the X11 or Wayland client libraries and working
   graphics drivers. Native Open and Save use the XDG desktop portal.
   Run `scripts/package-portable.sh linux-arm64 target/release/prints-desktop`
-  for ARM64 or use `linux-x64` for x64.
+  for ARM64 or use `linux-x64` for x64. Portable archives include a desktop
+  entry and the Prints icon. For application-menu integration, install the
+  binary on your PATH, put the entry in `~/.local/share/applications`, and
+  put its PNG in `~/.local/share/icons/hicolor/1024x1024/apps`.
 - **Windows x64** · Build with Rust and the Visual Studio C++ build tools, or
   use the GNU Rust target and MinGW-w64. To package a native GNU cross-build,
   run `scripts/package-portable.sh windows-x64 target/x86_64-pc-windows-gnu/release/prints-desktop.exe`.

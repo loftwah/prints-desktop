@@ -8,7 +8,7 @@ import sys
 from tempfile import TemporaryDirectory
 
 ROOT = Path(__file__).resolve().parents[1]
-BINARY = ROOT / "target/debug" / ("prints-desktop.exe" if sys.platform == "win32" else "prints-desktop")
+BINARY = ROOT / Path(os.environ.get("CARGO_TARGET_DIR", "target")) / "debug" / ("prints-desktop.exe" if sys.platform == "win32" else "prints-desktop")
 ORIGINAL = (ROOT / "assets/blue-hour.jpg").read_bytes()
 
 

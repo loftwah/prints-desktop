@@ -4,6 +4,7 @@ import argparse
 import base64
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -11,7 +12,7 @@ import tempfile
 import threading
 
 ROOT = Path(__file__).resolve().parents[1]
-BINARY = ROOT / "target/debug" / ("prints-desktop.exe" if sys.platform == "win32" else "prints-desktop")
+BINARY = ROOT / Path(os.environ.get("CARGO_TARGET_DIR", "target")) / "debug" / ("prints-desktop.exe" if sys.platform == "win32" else "prints-desktop")
 ASSET = (ROOT / "assets/horizon.jpg").read_bytes()
 KEY = "oyk_fictional_local_app_key"
 CALLS = []
