@@ -53,7 +53,9 @@ Get the archives and SHA-256 checksums from the [v0.4.1 release](https://github.
 | **Linux** · x64 or ARM64 | Extract the tarball and run `prints-desktop` in a graphical session. [Runtime prerequisites](CONTRIBUTING.md#platform-setup) | Both packages opened in Debian graphical test sessions. Find and Escape worked, and the x64 session used OrbStack CPU translation. |
 | **Windows** · x64 | Extract the ZIP and run `prints-desktop.exe`. | Unsigned x64 cross-build. Archive and embedded source checks passed. A Windows desktop launch is unverified. |
 
-[Windows and Mac distribution status](https://github.com/loftwah/prints-desktop/issues/7) · [Public download counts](https://prints.loftwah.com/downloads)
+If Gatekeeper blocks the Mac ZIP, build the `v0.4.1` tag with the free Xcode command-line tools and Rust, or try the contact sheet in your browser. A local build needs no Apple Developer Program membership. [Install guide and exact build commands](https://prints.loftwah.com/guide#install)
+
+[Windows desktop verification](https://github.com/loftwah/prints-desktop/issues/7) · [Public download counts](https://prints.loftwah.com/downloads)
 
 ## Build or help
 
