@@ -1,6 +1,6 @@
-use rune::{El, SurfaceFit, Tx, col, el, row};
+use rune::{El, Tx, col, el, row};
 
-use crate::{Ink, Print, Screen, Studio, action, label, photo};
+use crate::{Ink, Print, Screen, Studio, action, label, viewer};
 
 const CAMPAIGN_PRINTS: [&str; 2] = ["higher-than-before.jpg", "higher-than-before-poster.jpg"];
 
@@ -11,6 +11,7 @@ pub(crate) enum Pair {
 }
 
 fn open(s: &mut Studio, tx: &mut Tx, pair: Pair) {
+    s.viewer.reset();
     s.screen = Screen::Compare(pair);
     tx.focus("close-comparison", tx.by_keys() || tx.focus_visible());
 }
@@ -88,28 +89,28 @@ pub(crate) fn control(s: &Studio, asset: &Print, p: Ink) -> Option<El> {
     Some(button)
 }
 
-fn panel(s: &Studio, asset: &Print, title: &str, p: Ink) -> El {
+fn panel(s: &Studio, asset: &Print, title: &str, p: Ink, pane: usize) -> El {
     col()
         .grow(1.0)
         .shrink()
         .gap(8.0)
         .min_w(0.0)
         .child(label(title, 18.0, 650.0, p.primary).truncate())
-        .child(
-            el().w_full()
-                .grow(1.0)
-                .shrink()
-                .child(photo(s, asset, SurfaceFit::Fit, p)),
-        )
+        .child(el().w_full().grow(1.0).shrink().child(viewer::stage(
+            &s.viewer,
+            s.original(asset).map(|picture| &picture.image),
+            asset.available(),
+            p,
+            pane,
+        )))
         .child(label(&asset.filename, 12.0, 500.0, p.muted).truncate_middle())
 }
 
 pub(crate) fn view(s: &Studio, pair: Pair, p: Ink) -> El {
-    let (key, title, description, images) = match pair {
+    let (key, title, images) = match pair {
         Pair::Campaign => (
             "campaign-comparison",
             "Higher Than Before",
-            "One release, two formats. Compare the artwork at its original proportions.",
             CAMPAIGN_PRINTS.map(|name| {
                 s.assets.iter().find(|asset| {
                     asset
@@ -121,7 +122,6 @@ pub(crate) fn view(s: &Studio, pair: Pair, p: Ink) -> El {
         Pair::Local(first, second) => (
             "local-comparison",
             "Compare images",
-            "Both originals shown at their own proportions.",
             [s.assets.get(first), s.assets.get(second)],
         ),
     };
@@ -136,8 +136,8 @@ pub(crate) fn view(s: &Studio, pair: Pair, p: Ink) -> El {
                 .grow(1.0)
                 .shrink()
                 .gap(15.0)
-                .child(panel(s, first, first_title, p))
-                .child(panel(s, second, second_title, p))
+                .child(panel(s, first, first_title, p, 0))
+                .child(panel(s, second, second_title, p, 1))
         }
         _ => label(
             "The comparison formats are unavailable.",
@@ -158,12 +158,13 @@ pub(crate) fn view(s: &Studio, pair: Pair, p: Ink) -> El {
                 .items_center()
                 .gap(12.0)
                 .child(
-                    col()
+                    label(title, 27.0, 650.0, p.primary)
                         .grow(1.0)
-                        .gap(4.0)
-                        .child(label(title, 27.0, 650.0, p.primary))
-                        .child(label(description, 13.0, 450.0, p.muted).wrap()),
+                        .shrink()
+                        .min_w(0.0)
+                        .truncate(),
                 )
+                .child(viewer::controls(&s.viewer, p, s.viewer.active(), true))
                 .child(action(
                     "close-comparison",
                     "Back to contact sheet",
