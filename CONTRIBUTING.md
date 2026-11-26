@@ -46,6 +46,8 @@ Use public or fictional inputs in reports, screenshots and recordings. Keep cred
 - **Linux** · Run `cargo build --locked --release`, then `scripts/package-portable.sh linux-arm64 target/release/prints-desktop` or use `linux-x64` for that architecture.
 - **Windows GNU** · Build for `x86_64-pc-windows-gnu`, then run `scripts/package-portable.sh windows-x64 target/x86_64-pc-windows-gnu/release/prints-desktop.exe`.
 
+For a portable release, set `PRINTS_SOURCE_REVISION` to the reviewed Git commit when compiling the binary. The connection report uses that public revision. The Mac packager supplies it automatically.
+
 A successful build proves that target compiled. Record any real or virtual desktop launches, signing, and what remains unverified in the release notes. Compare the final archive against its SHA-256 file before using it.
 
 [Desktop workspace design](docs/native-workspace.md) · [Oyster transport and verification](docs/oyster.md) · [Artwork provenance](assets/README.md)
