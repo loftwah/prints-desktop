@@ -15,6 +15,7 @@ mod hosted;
 mod local;
 mod local_images;
 mod navigation;
+mod viewer;
 
 use rune::prefs::Prefs;
 use rune::tok::TextStyle;
@@ -271,6 +272,8 @@ struct Studio {
     local_loaded: bool,
     proof: bool,
     hosted: hosted::Hosted,
+    viewer: viewer::Viewer,
+    preview_return: Option<String>,
 }
 
 impl Studio {
@@ -334,6 +337,8 @@ impl Studio {
             local_loaded: false,
             proof,
             hosted,
+            viewer: viewer::Viewer::default(),
+            preview_return: None,
         }
     }
 
@@ -529,6 +534,31 @@ impl Studio {
         }
     }
 
+    /// Enter full view, remembering the control that initiated it so the return can restore that
+    /// focus instead of dropping it.
+    fn open_preview(&mut self, tx: &mut Tx) {
+        if self.screen != Screen::Preview {
+            self.preview_return = Some(
+                tx.focused()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| "featured-image".into()),
+            );
+            self.viewer.reset();
+        }
+        self.screen = Screen::Preview;
+        tx.focus("close-preview", tx.by_keys() || tx.focus_visible());
+    }
+
+    /// Return from full view with the initiating focus restored.
+    fn close_preview(&mut self, tx: &mut Tx) {
+        self.screen = Screen::Workspace;
+        if let Some(key) = self.preview_return.take() {
+            tx.focus(key, tx.by_keys() || tx.focus_visible());
+        } else {
+            tx.blur();
+        }
+    }
+
     fn step(&mut self, direction: isize) {
         let list = self.visible();
         if list.is_empty() {
@@ -541,6 +571,9 @@ impl Studio {
         let next = (current as isize + direction).rem_euclid(list.len() as isize) as usize;
         self.selected = Some(list[next]);
         self.status.clear();
+        if self.screen == Screen::Preview {
+            self.viewer.reset();
+        }
     }
 
     fn turn_contact_page(&mut self, forward: bool, tx: &mut Tx) {
@@ -1618,7 +1651,7 @@ fn workspace(s: &Studio, p: Ink) -> El {
         .focus_ring(2.0, 2.0, p.accent)
         .cursor(Cursor::Pointer)
         .child(view)
-        .on_press(|s: &mut Studio| s.screen = Screen::Preview);
+        .on_press_tx(Studio::open_preview);
     let mut caption = row().gap(8.0).items_center().child(
         col()
             .grow(1.0)
@@ -1632,8 +1665,8 @@ fn workspace(s: &Studio, p: Ink) -> El {
         caption = caption.child(compare);
     }
     caption = caption
-        .child(action("preview", "Full view", p, false, |s, _| {
-            s.screen = Screen::Preview
+        .child(action("preview", "Full view", p, false, |s, tx| {
+            s.open_preview(tx)
         }))
         .child(action(
             "inspector-toggle",
@@ -1646,7 +1679,7 @@ fn workspace(s: &Studio, p: Ink) -> El {
             false,
             |s, _| s.inspector = !s.inspector,
         ));
-    let mut strip = row().key("contact-sheet").w_full().gap(7.0);
+    let mut strip = row().key("contact-sheet").w_full().gap(7.0).role("listbox");
     let page = contact_page(&visible, s.selected);
     for &i in &visible[page.clone()] {
         let width = if visible.len() == 1 { 170.0 } else { f32::MAX };
@@ -1665,8 +1698,10 @@ fn workspace(s: &Studio, p: Ink) -> El {
                 .fill(if chosen { p.field } else { p.bg })
                 .border(1.0, if chosen { p.accent } else { p.line })
                 .hover(p.field)
-                .role("button")
+                .role("option")
                 .label(format!("Select {}", tile.title))
+                .focus_selected(chosen)
+                .press_on_return()
                 .focusable(true)
                 .focus_ring(2.0, 1.0, p.accent)
                 .cursor(Cursor::Pointer)
@@ -1765,10 +1800,7 @@ fn fullscreen(s: &Studio, p: Ink) -> El {
         "Back to contact sheet",
         p,
         false,
-        |s, tx| {
-            s.screen = Screen::Workspace;
-            tx.blur();
-        },
+        Studio::close_preview,
     );
     col()
         .key("full-view")
@@ -1787,14 +1819,16 @@ fn fullscreen(s: &Studio, p: Ink) -> El {
                         .grow(1.0)
                         .truncate(),
                 )
+                .child(viewer::controls(&s.viewer, p, s.viewer.active(), false))
                 .child(close),
         )
-        .child(
-            el().w_full()
-                .grow(1.0)
-                .shrink()
-                .child(photo(s, asset, SurfaceFit::Fit, p)),
-        )
+        .child(el().w_full().grow(1.0).shrink().child(viewer::stage(
+            &s.viewer,
+            s.original(asset).map(|picture| &picture.image),
+            asset.available(),
+            p,
+            0,
+        )))
         .child(
             row()
                 .w_full()
@@ -1876,7 +1910,8 @@ fn drafting(s: &Studio, p: Ink) -> El {
         .child(draft::shortlist(s, p))
 }
 
-fn view(s: &Studio, _: &mut Cx<Studio>) -> El {
+fn view(s: &Studio, cx: &mut Cx<Studio>) -> El {
+    s.viewer.set_device_scale(cx.env().scale);
     let p = Ink::new(s.theme_light);
     let mut shell = row().key("workspace").h_full().w_full().fill(p.bg);
     if s.screen == Screen::Preview {
@@ -1908,6 +1943,7 @@ fn view(s: &Studio, _: &mut Cx<Studio>) -> El {
 }
 
 fn keyboard(s: &mut Studio, event: &KeyEvent, tx: &mut Tx) -> bool {
+    let inspecting = matches!(s.screen, Screen::Preview | Screen::Compare(_));
     match event.key {
         Key::Escape
             if s.screen == Screen::Workspace
@@ -1919,6 +1955,7 @@ fn keyboard(s: &mut Studio, event: &KeyEvent, tx: &mut Tx) -> bool {
         Key::Escape if matches!(s.screen, Screen::Compare(_)) => {
             comparison::return_to_workspace(s, tx);
         }
+        Key::Escape if s.screen == Screen::Preview => s.close_preview(tx),
         Key::Escape if s.screen != Screen::Workspace => {
             s.screen = Screen::Workspace;
             tx.blur();
@@ -1930,6 +1967,33 @@ fn keyboard(s: &mut Studio, event: &KeyEvent, tx: &mut Tx) -> bool {
         Key::Command('s') if s.screen == Screen::Draft => s.save_draft(),
         Key::Command('s') if matches!(s.screen, Screen::Workspace | Screen::Preview) => {
             export(s, tx)
+        }
+        // Zoom and pan keys are inspection-only. They move the camera but never blur the
+        // button that has keyboard focus, so Tab and Return still work on the controls.
+        Key::Command('=') | Key::Command('+') if inspecting => {
+            let pane = s.viewer.active();
+            s.viewer.zoom_in(pane, tx)
+        }
+        Key::Command('-') | Key::Command('_') if inspecting => {
+            let pane = s.viewer.active();
+            s.viewer.zoom_out(pane, tx)
+        }
+        Key::Command('0') if inspecting => {
+            let pane = s.viewer.active();
+            s.viewer.fit(pane, tx)
+        }
+        Key::Left | Key::Right | Key::Up | Key::Down
+            if inspecting && s.viewer.zoomed(s.viewer.active()) =>
+        {
+            let pane = s.viewer.active();
+            let delta = match event.key {
+                Key::Left => (-1.0, 0.0),
+                Key::Right => (1.0, 0.0),
+                Key::Up => (0.0, -1.0),
+                Key::Down => (0.0, 1.0),
+                _ => (0.0, 0.0),
+            };
+            s.viewer.pan_key(pane, delta.0, delta.1, tx);
         }
         Key::Left | Key::Right if matches!(s.screen, Screen::Workspace | Screen::Preview) => {
             let focused_tile = tx.focused().is_some_and(|key| key.starts_with("print-"));
@@ -1944,7 +2008,7 @@ fn keyboard(s: &mut Studio, event: &KeyEvent, tx: &mut Tx) -> bool {
         Key::Enter
             if s.screen == Screen::Workspace && s.selected.is_some() && tx.focused().is_none() =>
         {
-            s.screen = Screen::Preview
+            s.open_preview(tx)
         }
         _ => return false,
     }
@@ -1977,6 +2041,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{Search, TextEdit};
+    use rune::{Cx, El, Env, Runtime, el, row};
 
     fn matches_terms(fields: &[&str], query: &str) -> bool {
         let mut search = Search {
@@ -2006,5 +2071,39 @@ mod tests {
         assert!(matches_terms(&fields, "   "));
         assert!(!matches_terms(&fields, "salt harbour"));
         assert!(!matches_terms(&fields, "relay"));
+    }
+
+    /// The contact sheet uses the role/state pair Rune maps to native selection. This checks the
+    /// element tree Rune feeds to the accessibility layer, not a spoken screen-reader result.
+    #[test]
+    fn selected_tile_reports_selection_state_in_the_element_tree() {
+        fn view(_: &(), _: &mut Cx<()>) -> El {
+            let tile = |key: &'static str, selected: bool| {
+                el().key(key)
+                    .role("option")
+                    .label(format!("Select {key}"))
+                    .focusable(true)
+                    .focus_selected(selected)
+                    .press_on_return()
+                    .size(100.0, 30.0)
+            };
+            row()
+                .key("sheet")
+                .role("listbox")
+                .child(tile("tile-0", true))
+                .child(tile("tile-1", false))
+        }
+        let mut runtime = Runtime::new((), view, (300.0, 100.0), Env::new(true, 1.0));
+        runtime.frame(0.0);
+        let elements = runtime.elements();
+        let selected = |key: &str| {
+            elements
+                .iter()
+                .find(|element| element.key.as_deref() == Some(key))
+                .unwrap()
+                .item_selected
+        };
+        assert!(selected("tile-0"));
+        assert!(!selected("tile-1"));
     }
 }

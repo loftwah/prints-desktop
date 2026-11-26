@@ -4,15 +4,15 @@
 
 **TL;DR** · Drop in a few exports or AI variants, compare them side by side and take the exact original with you. Prints works offline without an account. Connect your own Oyster library to browse and export generated work.
 
-[Try the browser demo](https://prints.loftwah.com/#afterlight) · [Download the desktop preview](https://github.com/loftwah/prints-desktop/releases/tag/v0.5.1) · [Contribute](CONTRIBUTING.md)
+[Try the browser demo](https://prints.loftwah.com/#afterlight) · [Download the desktop preview](https://github.com/loftwah/prints-desktop/releases/tag/v0.5.2) · [Contribute](CONTRIBUTING.md)
 
 ## Quickstarts
 
-- **Desktop.** [Download the matching archive](https://github.com/loftwah/prints-desktop/releases/tag/v0.5.1) and [open Prints](https://prints.loftwah.com/guide#install). In **Creative Archive**, pick **Higher Than Before**, choose **Compare formats**, then return to the contact sheet and choose **Export original**.
+- **Desktop.** [Download the matching archive](https://github.com/loftwah/prints-desktop/releases/tag/v0.5.2) and [open Prints](https://prints.loftwah.com/guide#install). In **Creative Archive**, pick **Higher Than Before**, choose **Compare formats**, then return to the contact sheet and choose **Export original**.
 - **Build from GitHub.** Install [Rust with rustup](https://rustup.rs/) and check the [platform prerequisites](CONTRIBUTING.md#platform-setup). Clone the release tag and run the locked build.
 
   ```sh
-  git clone --branch v0.5.1 --depth 1 https://github.com/loftwah/prints-desktop.git
+  git clone --branch v0.5.2 --depth 1 https://github.com/loftwah/prints-desktop.git
   cd prints-desktop
   cargo run --locked
   ```
@@ -57,6 +57,11 @@ Keep this read-only. Ask me to select an output before exporting anything.
 
 The desktop app reads compatible Oyster libraries and hands creation off to signed-in web Prints. Hosted generation requires model access and funding. [Connection and permission details](docs/oyster.md) · [Native creation status](https://github.com/loftwah/prints-desktop/issues/6)
 
+In **Full view** or **Compare**, choose **Fit** to see the whole image or
+**100%** to inspect one original pixel per device pixel. Drag or use the arrow
+keys to pan a zoomed image. In comparison, choose **Link views** to move both
+views together. **Checkerboard** makes transparency visible.
+
 Prints saves a working draft after a short pause in editing and flushes pending
 changes on normal close. After a crash or forced quit, the last completed save
 is available. The editor shows when a save fails so you can retry. **Undo clear**
@@ -64,7 +69,7 @@ recovers the most recent cleared brief, including after reopening.
 
 ## Get the preview
 
-Get the archives, SHA-256 checksums and platform verification details from the [v0.5.1 release](https://github.com/loftwah/prints-desktop/releases/tag/v0.5.1).
+Get the archives, SHA-256 checksums and platform verification details from the [v0.5.2 release](https://github.com/loftwah/prints-desktop/releases/tag/v0.5.2).
 
 | Platform | Run it | Verified |
 | --- | --- | --- |
@@ -72,7 +77,7 @@ Get the archives, SHA-256 checksums and platform verification details from the [
 | **Linux** · x64 or ARM64 | Extract the tarball and run `prints-desktop` in a graphical session. [Runtime prerequisites](CONTRIBUTING.md#platform-setup) | See the release for Debian graphical verification and x64 translation coverage. |
 | **Windows** · x64 | Extract the ZIP and open `Prints Desktop.exe`. | Unsigned x64 cross-build. Archive and embedded source checks passed. A Windows desktop launch is unverified. |
 
-If Gatekeeper blocks the Mac ZIP, build the `v0.5.1` tag with the free Xcode command-line tools and Rust, or try the contact sheet in your browser. A local build needs no Apple Developer Program membership. [Install guide and exact build commands](https://prints.loftwah.com/guide#install)
+If Gatekeeper blocks the Mac ZIP, build the `v0.5.2` tag with the free Xcode command-line tools and Rust, or try the contact sheet in your browser. A local build needs no Apple Developer Program membership. [Install guide and exact build commands](https://prints.loftwah.com/guide#install)
 
 [Windows desktop verification](https://github.com/loftwah/prints-desktop/issues/7) · [Public download counts](https://prints.loftwah.com/downloads) · [v0.4.1 benchmark baseline](docs/preview-benchmark.md)
 
