@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 mod library;
-pub use library::{Folder, FolderPage};
+pub use library::{Folder, FolderPage, TransferCapture};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use reqwest::blocking::{Client, Response};
@@ -87,10 +87,19 @@ pub enum Error {
     InvalidPrintId,
     InvalidArgument,
     Transport,
-    Status { status: u16, code: Option<String> },
-    Refused { method: &'static str, code: String },
+    Status {
+        status: u16,
+        code: Option<String>,
+    },
+    Refused {
+        method: &'static str,
+        code: String,
+    },
     TooLarge,
     Decode,
+    /// A cooperative stop observed before a further chunk was requested. It
+    /// never claims that an already in-flight blocking call was aborted.
+    Cancelled,
 }
 
 impl Error {
@@ -121,6 +130,7 @@ pub enum Category {
     InvalidArgument,
     Decode,
     Local,
+    Cancelled,
 }
 
 impl Category {
@@ -135,6 +145,7 @@ impl Category {
             Self::InvalidArgument => "invalid local argument",
             Self::Decode => "malformed reply",
             Self::Local => "local operation failure",
+            Self::Cancelled => "transfer stopped before next chunk",
         }
     }
 }
@@ -196,6 +207,7 @@ impl Error {
             Self::Status { .. } => Category::Status,
             Self::Refused { .. } => Category::Refused,
             Self::TooLarge => Category::TooLarge,
+            Self::Cancelled => Category::Cancelled,
             Self::InvalidArgument
             | Self::InvalidBaseUrl
             | Self::CredentialsInUrl
@@ -289,6 +301,7 @@ impl fmt::Display for Error {
             }
             Self::TooLarge => f.write_str("response exceeded the client byte limit"),
             Self::Decode => f.write_str("unexpected or malformed Oyster reply"),
+            Self::Cancelled => f.write_str("transfer stopped before the next chunk was requested"),
         }
     }
 }
@@ -511,6 +524,23 @@ impl OysterClient {
         print_id: &str,
         expected_path: Option<&str>,
     ) -> Result<Vec<u8>, Error> {
+        self.download_observed(print_id, expected_path, None, None, None)
+    }
+
+    /// The shared chunk loop. `cancel` is checked before each new request and
+    /// again once a reply has been decoded: a stop therefore prevents further
+    /// dispatch and drops the decoder buffer, while an already in-flight
+    /// blocking call is left to finish without any claim that it was aborted.
+    /// Progress is only reported from decoded, retained bytes, and `total` is
+    /// passed through only when the caller has an explicit trustworthy value.
+    pub(crate) fn download_observed(
+        &self,
+        print_id: &str,
+        expected_path: Option<&str>,
+        total: Option<u64>,
+        cancel: Option<&AtomicBool>,
+        mut on_progress: Option<&mut dyn FnMut(TransferProgress)>,
+    ) -> Result<Vec<u8>, Error> {
         if !valid_print_id(print_id) {
             return Err(Error::InvalidPrintId);
         }
@@ -519,10 +549,20 @@ impl OysterClient {
         let mut path = expected_path.map(str::to_owned);
         let deadline = Instant::now() + DOWNLOAD_BUDGET;
         for _ in 0..=MAX_DOWNLOAD_BYTES / MAX_CHUNK_BYTES + 16 {
+            if cancel.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+                out.clear();
+                return Err(Error::Cancelled);
+            }
             if Instant::now() >= deadline {
                 return Err(Error::Transport);
             }
             let read = self.open_output_chunk(print_id, offset, MAX_CHUNK_BYTES)?;
+            // The request above may already have been in flight when stop was
+            // requested. Its bytes are dropped, not reported as a completion.
+            if cancel.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+                out.clear();
+                return Err(Error::Cancelled);
+            }
             match &path {
                 None => path = Some(read.path.clone()),
                 Some(expected) if expected == &read.path => {}
@@ -541,6 +581,12 @@ impl OysterClient {
             }
             out.extend_from_slice(&bytes);
             offset += bytes.len() as u64;
+            if let Some(report) = on_progress.as_deref_mut() {
+                report(TransferProgress {
+                    observed: offset,
+                    total,
+                });
+            }
         }
         Err(Error::TooLarge)
     }
@@ -772,6 +818,16 @@ pub struct ByteRead {
     pub encoding: String,
     #[allow(dead_code)]
     pub truncated: bool,
+}
+
+/// Observed progress for one original transfer. `observed` counts only bytes
+/// that were decoded and retained from a real reply. `total` is `None` unless
+/// the captured record supplied an explicit, positive size; no percentage is
+/// ever inferred from a chunk count or a `truncated` flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransferProgress {
+    pub observed: u64,
+    pub total: Option<u64>,
 }
 
 #[cfg(test)]
