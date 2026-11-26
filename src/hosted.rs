@@ -1018,6 +1018,13 @@ impl Hosted {
 }
 
 fn credential(profile: &Profile) -> Result<keyring::Entry, Failure> {
+    if crate::tooling_mode::isolated() {
+        return Err(Failure::local(
+            "connect",
+            "credential",
+            "Verification profiles use session-only keys.",
+        ));
+    }
     let (origin, installation) = profile;
     keyring::Entry::new(KEY_SERVICE, &format!("{origin}/{installation}")).map_err(|_| {
         Failure::local(

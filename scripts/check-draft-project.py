@@ -57,9 +57,13 @@ with TemporaryDirectory(prefix="prints-draft-project-") as temporary:
     def workspace():
         return json.loads(working.read_text())["workspace"]
 
-    assert workspace()["library"] == [{"path": str(original), "favourite": True}]
+    original_id = workspace()["library"][0]["id"]
+    workspace_id = workspace()["workspace_id"]
+    assert original_id.startswith("local:") and workspace_id.startswith("ws:")
+    assert workspace()["library"] == [{"id": original_id, "path": str(original), "favourite": True}]
     assert workspace()["shortlist"] == [
-        {"Bundled": "higher-than-before.jpg"}, {"Linked": str(original)},
+        {"id": "bundled:archive:higher-than-before.jpg", "Bundled": "higher-than-before.jpg"},
+        {"id": original_id, "Linked": str(original)},
     ]
 
     new_brief = saved_draft + " Keep the square version for the album tile."
@@ -106,8 +110,9 @@ with TemporaryDirectory(prefix="prints-draft-project-") as temporary:
     ])
     assert "Selected study" in recovered
     assert new_brief in recovered
-    assert workspace()["library"] == [{"path": str(moved), "favourite": True}]
-    assert workspace()["shortlist"][-1] == {"Linked": str(moved)}
+    assert workspace()["library"] == [{"id": original_id, "path": str(moved), "favourite": True}]
+    assert workspace()["workspace_id"] == workspace_id
+    assert workspace()["shortlist"][-1] == {"id": original_id, "Linked": str(moved)}
 
     destination = run / "Selected export.jpg"
     exported = replay(run, [
@@ -122,8 +127,11 @@ with TemporaryDirectory(prefix="prints-draft-project-") as temporary:
     removed = replay(run, [tap(0.2, "draft"), tap(0.5, "draft-remove-11")])
     assert "Removed from draft." in removed
     assert "Open Selected study" not in removed
-    assert workspace()["library"] == [{"path": str(moved), "favourite": True}]
-    assert workspace()["shortlist"] == [{"Bundled": "higher-than-before.jpg"}]
+    assert workspace()["library"] == [{"id": original_id, "path": str(moved), "favourite": True}]
+    assert workspace()["workspace_id"] == workspace_id
+    assert workspace()["shortlist"] == [
+        {"id": "bundled:archive:higher-than-before.jpg", "Bundled": "higher-than-before.jpg"},
+    ]
     assert workspace()["text"] == new_brief
     cleared = replay(run, [tap(0.2, "draft"), tap(0.5, "clear-draft")])
     assert "Undo clear" in cleared and workspace()["text"] == ""

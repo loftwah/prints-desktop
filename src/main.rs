@@ -1,11 +1,13 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+mod agent_bridge;
 mod archive;
 mod comparison;
 mod disk;
@@ -15,7 +17,11 @@ mod hosted;
 mod local;
 mod local_images;
 mod navigation;
+mod tooling_mode;
 mod viewer;
+mod workspace;
+
+use workspace::{AccessMode, AgentAccess, AssetId, Fault, Surface, WorkspaceId};
 
 use rune::prefs::Prefs;
 use rune::tok::TextStyle;
@@ -97,6 +103,7 @@ enum Screen {
     Draft,
     Connection,
     Hosted,
+    Agent,
 }
 
 struct Picture {
@@ -120,6 +127,7 @@ enum Original {
 }
 
 struct Print {
+    id: AssetId,
     title: String,
     filename: String,
     find: String,
@@ -127,7 +135,7 @@ struct Print {
 }
 
 impl Print {
-    fn new(title: String, filename: String, original: Original) -> Self {
+    fn new(title: String, filename: String, original: Original, id: AssetId) -> Self {
         let mut fields = vec![title.as_str(), filename.as_str()];
         match &original {
             Original::Afterlight(study, _) => fields.extend([study.note, study.prompt]),
@@ -136,6 +144,7 @@ impl Print {
         }
         let find = fields.join("\n").to_lowercase();
         Self {
+            id,
             title,
             filename,
             find,
@@ -143,7 +152,7 @@ impl Print {
         }
     }
 
-    fn linked(path: PathBuf, filename: Option<String>) -> Self {
+    fn linked(path: PathBuf, filename: Option<String>, id: AssetId) -> Self {
         let title = path.file_stem().map_or_else(
             || "Saved local image".into(),
             |stem| stem.to_string_lossy().into_owned(),
@@ -159,7 +168,12 @@ impl Print {
                 path,
                 available: true,
             },
+            id,
         )
+    }
+
+    fn id(&self) -> &AssetId {
+        &self.id
     }
 
     fn study(&self) -> Option<&'static Study> {
@@ -253,7 +267,13 @@ struct Studio {
     screen: Screen,
     assets: Vec<Print>,
     selected: Option<usize>,
-    comparison_first: Option<PathBuf>,
+    comparison_first: Option<AssetId>,
+    human_edits: u64,
+    ids_migrated: bool,
+    agent: AgentAccess,
+    bridge: agent_bridge::Bridge,
+    agent_focus: Option<String>,
+    agent_save: bool,
     favourites: Vec<usize>,
     theme_light: bool,
     inspector: bool,
@@ -278,15 +298,8 @@ struct Studio {
 
 impl Studio {
     fn new() -> Self {
-        let proof = cfg!(debug_assertions)
-            && std::env::args()
-                .any(|arg| matches!(arg.as_str(), "--snap" | "--tree" | "--script" | "--video"));
-        let prefs = if proof {
-            std::env::var_os("PRINTS_REPLAY_PREFS")
-                .map_or_else(Prefs::memory, |path| Prefs::at(PathBuf::from(path)))
-        } else {
-            Prefs::open(APP_ID)
-        };
+        let proof = tooling_mode::isolated();
+        let prefs = tooling_mode::preferences(APP_ID);
         let mut favourites: Vec<usize> = prefs.get("favourites").unwrap_or_default();
         favourites.retain(|&i| i < AFTERLIGHT.len());
         favourites.sort_unstable();
@@ -319,6 +332,12 @@ impl Studio {
             assets: Vec::new(),
             selected: Some(AFTERLIGHT.len()),
             comparison_first: None,
+            human_edits: 0,
+            ids_migrated: false,
+            agent: AgentAccess::off(working.workspace_id.clone()),
+            bridge: agent_bridge::Bridge::default(),
+            agent_focus: None,
+            agent_save: false,
             favourites,
             theme_light,
             inspector: true,
@@ -355,6 +374,7 @@ impl Studio {
                     study.title.into(),
                     study.filename.into(),
                     Original::Afterlight(study, Picture::new(study.bytes.into(), &cache)),
+                    AssetId::bundled("afterlight", study.filename),
                 )
             })
             .collect();
@@ -363,9 +383,10 @@ impl Studio {
                 edition.title.into(),
                 edition.filename.into(),
                 Original::Edition(edition, Picture::new(edition.bytes.into(), &cache)),
+                AssetId::bundled("archive", edition.filename),
             )
         }));
-        draft::restore_bundled(self);
+        self.ids_migrated |= draft::restore_bundled(self);
         if self.proof {
             for picture in self.assets.iter().filter_map(Print::picture) {
                 let _ = picture.image.wait();
@@ -385,14 +406,19 @@ impl Studio {
         } else {
             (self.prefs.get(local::LIBRARY_KEY), None)
         };
-        for record in local::read(records) {
+        let mut records = local::read(records);
+        if local::migrate_ids(&mut records) {
+            self.ids_migrated = true;
+        }
+        for record in records {
             if record.favourite {
                 self.favourites.push(self.assets.len());
             }
             if shortlist.is_none() && record.in_draft {
                 self.draft_shortlist.push(self.assets.len());
             }
-            self.assets.push(Print::linked(record.path, None));
+            self.assets
+                .push(Print::linked(record.path, None, record.id));
         }
         if let Some(entries) = shortlist {
             self.draft_shortlist = draft::resolve(&self.assets, &entries);
@@ -493,6 +519,7 @@ impl Studio {
         let visible = self.visible();
         if self.selected.is_none_or(|i| !visible.contains(&i)) {
             self.selected = visible.first().copied();
+            self.touch();
         }
     }
 
@@ -536,13 +563,9 @@ impl Studio {
 
     /// Enter full view, remembering the control that initiated it so the return can restore that
     /// focus instead of dropping it.
-    fn open_preview(&mut self, tx: &mut Tx) {
+    fn open_preview(&mut self, tx: &mut Tx, return_to: &'static str) {
         if self.screen != Screen::Preview {
-            self.preview_return = Some(
-                tx.focused()
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| "featured-image".into()),
-            );
+            self.preview_return = Some(return_to.into());
             self.viewer.reset();
         }
         self.screen = Screen::Preview;
@@ -571,6 +594,7 @@ impl Studio {
         let next = (current as isize + direction).rem_euclid(list.len() as isize) as usize;
         self.selected = Some(list[next]);
         self.status.clear();
+        self.touch();
         if self.screen == Screen::Preview {
             self.viewer.reset();
         }
@@ -593,6 +617,7 @@ impl Studio {
 
     fn favourite(&mut self) {
         let Some(i) = self.selected else { return };
+        self.touch();
         if self.favourites.contains(&i) {
             self.favourites.retain(|&value| value != i);
         } else {
@@ -671,14 +696,22 @@ impl Studio {
         };
         let origin = self.import_origin.take();
         let start = self.assets.len();
+        let mut used: HashSet<String> = self
+            .assets
+            .iter()
+            .map(|asset| asset.id().as_str().to_owned())
+            .collect();
         for (path, original) in batch.images {
             // A linked image can be relocated while the batch is being read.
             if !self.refs().any(|existing| existing == path) {
-                self.assets.push(Print::linked(path, Some(original)));
+                let id = AssetId::fresh(&used);
+                used.insert(id.as_str().to_owned());
+                self.assets.push(Print::linked(path, Some(original), id));
             }
         }
         let linked = self.assets.len() - start;
         if linked > 0 {
+            self.touch();
             if origin == Some((self.screen, self.shelf)) {
                 self.show_shelf(Shelf::Imports);
                 self.selected = Some(start);
@@ -716,8 +749,9 @@ impl Studio {
         };
         match validate_original(path) {
             Ok(filename) => {
+                let id = self.assets[index].id().clone();
                 self.local_images.invalidate(path);
-                self.assets[index] = Print::linked(path.to_path_buf(), Some(filename));
+                self.assets[index] = Print::linked(path.to_path_buf(), Some(filename), id);
                 self.sync_selection();
                 self.focus_after_recovery(index, tx);
                 self.status = "Original refreshed.".into();
@@ -754,11 +788,10 @@ impl Studio {
         }
         match validate_original(&source) {
             Ok(filename) => {
+                let id = self.assets[index].id().clone();
                 self.local_images.invalidate(previous);
-                if self.comparison_first.as_deref() == Some(previous) {
-                    self.comparison_first = Some(source.clone());
-                }
-                self.assets[index] = Print::linked(source, Some(filename));
+                self.touch();
+                self.assets[index] = Print::linked(source, Some(filename), id);
                 self.sync_selection();
                 self.focus_after_recovery(index, tx);
                 if self.persist_local() {
@@ -786,10 +819,12 @@ impl Studio {
         let Some(path) = self.assets.get(index).and_then(Print::path) else {
             return;
         };
-        if self.comparison_first.as_deref() == Some(path) {
+        let id = self.assets.get(index).map(Print::id).cloned();
+        if self.comparison_first == id && id.is_some() {
             self.comparison_first = None;
         }
         self.local_images.invalidate(path);
+        self.touch();
         self.assets.remove(index);
         let removed_from_draft = draft::forget_asset(self, index);
         self.favourites.retain(|&i| i != index);
@@ -815,6 +850,7 @@ impl Studio {
         };
         if self.draft.text.trim().is_empty() {
             self.draft = TextEdit::new(study.prompt);
+            self.touch();
             self.working.pending(tx);
             self.status.clear();
             if !self.draft_shortlist.contains(&index) {
@@ -829,6 +865,267 @@ impl Studio {
 
     fn save_draft(&mut self) {
         draft::persist(self);
+    }
+
+    /// Bump the human-edit part of the revision. Visible state also feeds the
+    /// revision, so a missed touch cannot make a stale write look current.
+    fn touch(&mut self) {
+        self.human_edits = self.human_edits.wrapping_add(1);
+    }
+
+    fn asset_index(&self, id: &AssetId) -> Option<usize> {
+        self.assets.iter().position(|asset| asset.id() == id)
+    }
+
+    /// Built from live state every time a command is evaluated.
+    fn revision(&self) -> u64 {
+        let shortlist: Vec<AssetId> = self
+            .draft_shortlist
+            .iter()
+            .filter_map(|&index| self.assets.get(index).map(|asset| asset.id().clone()))
+            .collect();
+        let assets: Vec<AssetId> = self.assets.iter().map(|asset| asset.id().clone()).collect();
+        let selected = self
+            .selected
+            .and_then(|index| self.assets.get(index))
+            .map(Print::id);
+        let compare_second = match self.screen {
+            Screen::Compare(comparison::Pair::Local(_, second)) => {
+                self.assets.get(second).map(Print::id)
+            }
+            _ => None,
+        };
+        workspace::revision_of(&workspace::RevisionParts {
+            human_edits: self.human_edits,
+            brief: &self.draft.text,
+            selected,
+            shortlist: &shortlist,
+            compare_first: self.comparison_first.as_ref(),
+            compare_second,
+            assets: &assets,
+        })
+    }
+
+    fn comparison_assets(&self) -> Option<[usize; 2]> {
+        match self.screen {
+            Screen::Compare(comparison::Pair::Local(first, second)) => Some([first, second]),
+            Screen::Compare(comparison::Pair::Campaign) => {
+                let index = |name| {
+                    self.assets
+                        .iter()
+                        .position(|asset| asset.edition().is_some() && asset.filename == name)
+                };
+                let [cover, poster] = comparison::CAMPAIGN_PRINTS;
+                Some([index(cover)?, index(poster)?])
+            }
+            _ => None,
+        }
+    }
+
+    fn asset_view(&self, index: usize, print: &Print) -> Option<workspace::AssetView> {
+        let selected = self.selected == Some(index);
+        let in_brief = self.draft_shortlist.contains(&index);
+        let active_pair = self.comparison_assets();
+        let compare_first = self.comparison_first.as_ref() == Some(print.id())
+            || active_pair.is_some_and(|[first, _]| first == index);
+        let compare_second = active_pair.is_some_and(|[_, second]| second == index);
+        if print.path().is_some() && !(selected || in_brief || compare_first || compare_second) {
+            return None;
+        }
+        Some(workspace::AssetView {
+            id: print.id().clone(),
+            title: print.title.chars().take(140).collect(),
+            selected,
+            in_brief,
+            comparable: print.available(),
+            compare_first,
+            compare_second,
+        })
+    }
+
+    fn show_agent_asset(&mut self, index: usize) {
+        let print = &self.assets[index];
+        let shelf = if print.path().is_some() {
+            Shelf::Imports
+        } else if print.study().is_some() {
+            Shelf::Samples
+        } else {
+            Shelf::Archive
+        };
+        self.show_shelf(shelf);
+        self.selected = Some(index);
+    }
+
+    // Native hooks shared by the Agent access panel and the transport.
+    pub(crate) fn agent_access(&self) -> &AgentAccess {
+        &self.agent
+    }
+
+    fn agent_activate(&mut self, mode: AccessMode) {
+        self.bridge.stop();
+        self.agent.revoke();
+        let Some(directory) = self
+            .prefs
+            .path()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+        else {
+            self.status = "Agent access needs a local workspace profile.".into();
+            return;
+        };
+        let Some(wake) = self.wake.clone() else {
+            self.status = "The workspace is still opening. Try again.".into();
+            return;
+        };
+        if !draft::persist(self) {
+            self.status = "Couldn’t save this workspace. Save the draft and try again.".into();
+            return;
+        }
+        if self.agent.activate(mode).is_err() {
+            self.status = "Couldn’t generate a private access key on this device.".into();
+            return;
+        }
+        let token = self.agent.bearer().expect("access was just enabled");
+        if self
+            .bridge
+            .start(&directory, self.agent.workspace().as_str(), token, wake)
+            .is_err()
+        {
+            self.agent.revoke();
+            self.status = "Couldn’t open local agent access. Try again.".into();
+            return;
+        }
+        self.status = "Copy the grant path to use this workspace with your local agent.".into();
+    }
+
+    fn agent_revoke(&mut self) {
+        self.bridge.stop();
+        self.agent.revoke();
+        self.status = "Agent access revoked.".into();
+    }
+
+    pub(crate) fn open_agent(&mut self) {
+        self.status.clear();
+        self.screen = Screen::Agent;
+    }
+}
+
+impl Surface for Studio {
+    fn workspace_id(&self) -> &WorkspaceId {
+        self.agent.workspace()
+    }
+
+    fn access(&self) -> &AgentAccess {
+        &self.agent
+    }
+
+    fn access_mut(&mut self) -> &mut AgentAccess {
+        &mut self.agent
+    }
+
+    fn revision(&self) -> u64 {
+        Studio::revision(self)
+    }
+
+    fn snapshot(&self, limit: usize) -> workspace::BriefSnapshot {
+        let mut permitted = self
+            .assets
+            .iter()
+            .enumerate()
+            .filter_map(|(index, print)| self.asset_view(index, print));
+        let assets = permitted.by_ref().take(limit).collect();
+        let mut text = self.draft.text.chars();
+        let brief = text.by_ref().take(8_000).collect();
+        workspace::BriefSnapshot {
+            brief,
+            brief_truncated: text.next().is_some(),
+            shortlist: self
+                .draft_shortlist
+                .iter()
+                .filter_map(|&index| self.assets.get(index).map(|asset| asset.id().clone()))
+                .collect(),
+            comparison: self
+                .comparison_assets()
+                .map(|pair| pair.map(|index| self.assets[index].id().clone())),
+            selected: self
+                .selected
+                .and_then(|index| self.assets.get(index))
+                .map(|asset| asset.id().clone()),
+            assets,
+            has_more: permitted.next().is_some(),
+        }
+    }
+
+    fn asset(&self, id: &AssetId) -> Option<workspace::AssetView> {
+        let index = self.asset_index(id)?;
+        self.asset_view(index, self.assets.get(index)?)
+    }
+
+    fn select(&mut self, id: &AssetId) -> Result<workspace::Change, Fault> {
+        let index = self.asset_index(id).ok_or(Fault::NotFound)?;
+        if self.selected == Some(index) && self.screen == Screen::Workspace {
+            return Ok(workspace::Change::Unchanged(
+                "That image is already selected.",
+            ));
+        }
+        self.show_agent_asset(index);
+        self.status.clear();
+        self.agent_focus = Some("featured-image".into());
+        Ok(workspace::Change::Applied)
+    }
+
+    fn compare(&mut self, first: &AssetId, second: &AssetId) -> Result<workspace::Change, Fault> {
+        let first_index = self.asset_index(first).ok_or(Fault::NotFound)?;
+        let second_index = self.asset_index(second).ok_or(Fault::NotFound)?;
+        self.show_agent_asset(second_index);
+        self.comparison_first = Some(first.clone());
+        comparison::start(self, comparison::Pair::Local(first_index, second_index));
+        self.agent_focus = Some("close-comparison".into());
+        Ok(workspace::Change::Applied)
+    }
+
+    fn edit_brief(&mut self, text: String) -> Result<workspace::Change, Fault> {
+        if self.draft.text == text {
+            return Ok(workspace::Change::Unchanged("The brief is unchanged."));
+        }
+        self.draft = TextEdit::new(text);
+        self.agent_save = true;
+        Ok(workspace::Change::Applied)
+    }
+
+    fn keep(&mut self, id: &AssetId) -> Result<workspace::Change, Fault> {
+        let index = self.asset_index(id).ok_or(Fault::NotFound)?;
+        if self.draft_shortlist.contains(&index) {
+            return Ok(workspace::Change::Unchanged("Already kept with the brief."));
+        }
+        if self.draft_shortlist.len() >= draft::SHORTLIST_LIMIT {
+            return Err(Fault::Limit);
+        }
+        draft::toggle(self, index);
+        Ok(workspace::Change::Applied)
+    }
+
+    fn remove(&mut self, id: &AssetId) -> Result<workspace::Change, Fault> {
+        let index = self.asset_index(id).ok_or(Fault::NotFound)?;
+        if !self.draft_shortlist.contains(&index) {
+            return Ok(workspace::Change::Unchanged(
+                "That image was not in the brief.",
+            ));
+        }
+        draft::toggle(self, index);
+        Ok(workspace::Change::Applied)
+    }
+
+    fn reopen(&mut self) -> Result<workspace::Change, Fault> {
+        self.open_local_library();
+        self.status.clear();
+        self.screen = Screen::Draft;
+        self.agent_focus = Some("draft-input".into());
+        Ok(workspace::Change::Applied)
+    }
+
+    fn note_write(&mut self, message: &'static str) {
+        self.status = message.into();
     }
 }
 
@@ -1198,11 +1495,38 @@ fn poll(s: &mut Studio, time: f64, tx: &mut Tx) -> bool {
     if draft_updated {
         s.save_draft();
     }
+    let mut agent_updated = false;
+    if s.ids_migrated {
+        s.ids_migrated = false;
+        s.save_draft();
+        agent_updated = true;
+    }
+    if let Some(mut call) = s.bridge.take() {
+        let request = std::mem::take(&mut call.request);
+        let mut response = workspace::evaluate_value(s, request);
+        if s.agent_save {
+            s.agent_save = false;
+            if !draft::persist(s) {
+                response["kind"] = serde_json::json!("accepted");
+                response["message"] =
+                    serde_json::json!("Changed in the app. The local save failed.");
+            }
+        }
+        if let Some(key) = s.agent_focus.take() {
+            if s.screen == Screen::Workspace {
+                s.reveal_selection(tx);
+            }
+            tx.focus(key, true);
+        }
+        call.answer(response);
+        agent_updated = true;
+    }
+    let changed = hosted_updated || imported || images_updated || draft_updated || agent_updated;
     let LocalExport::WriteOriginal(write) = &s.local_export else {
-        return hosted_updated || imported || images_updated || draft_updated;
+        return changed;
     };
     let Some(result) = write.take() else {
-        return hosted_updated || imported || images_updated || draft_updated;
+        return changed;
     };
     s.local_export = LocalExport::Idle;
     s.status = match result {
@@ -1223,7 +1547,10 @@ fn export_action(s: &Studio, key: &'static str, p: Ink) -> El {
 }
 
 fn finish_writes(s: &mut Studio, _: &mut Tx) {
-    if s.working.needs_save() {
+    s.bridge.stop();
+    s.agent.revoke();
+    if s.working.needs_save() || s.agent_save {
+        s.agent_save = false;
         s.save_draft();
     }
     s.local_export = LocalExport::Idle;
@@ -1377,6 +1704,13 @@ fn rail(s: &Studio, p: Ink) -> El {
                 s.status.clear();
                 s.screen = Screen::Connection;
             },
+        ))
+        .child(nav(
+            "agent-access",
+            "Agent access",
+            s.screen == Screen::Agent,
+            p,
+            |s, _| s.open_agent(),
         ))
         .child(
             row()
@@ -1651,7 +1985,7 @@ fn workspace(s: &Studio, p: Ink) -> El {
         .focus_ring(2.0, 2.0, p.accent)
         .cursor(Cursor::Pointer)
         .child(view)
-        .on_press_tx(Studio::open_preview);
+        .on_press_tx(|s: &mut Studio, tx| s.open_preview(tx, "featured-image"));
     let mut caption = row().gap(8.0).items_center().child(
         col()
             .grow(1.0)
@@ -1666,7 +2000,7 @@ fn workspace(s: &Studio, p: Ink) -> El {
     }
     caption = caption
         .child(action("preview", "Full view", p, false, |s, tx| {
-            s.open_preview(tx)
+            s.open_preview(tx, "preview")
         }))
         .child(action(
             "inspector-toggle",
@@ -1718,6 +2052,7 @@ fn workspace(s: &Studio, p: Ink) -> El {
                 .on_press(move |s: &mut Studio| {
                     s.selected = Some(i);
                     s.status.clear();
+                    s.touch();
                 }),
         );
     }
@@ -1855,6 +2190,130 @@ fn fullscreen(s: &Studio, p: Ink) -> El {
         )
 }
 
+/// Native, discoverable opt-in. The bearer is deliberately not shown here:
+/// token presentation belongs to the coordinator's local bridge.
+fn agent_panel(s: &Studio, p: Ink) -> El {
+    let access = s.agent_access();
+    let (state, state_color) = match access.mode() {
+        None => ("Off", p.muted),
+        Some(AccessMode::Read) => ("Read only", p.accent),
+        Some(AccessMode::Edit) => ("Can edit", p.accent),
+    };
+    let mut controls = col().w_full().gap(8.0);
+    match access.mode() {
+        None => {
+            controls = controls
+                .child(
+                    action(
+                        "agent-enable-read",
+                        "Enable read access",
+                        p,
+                        true,
+                        |s, _| {
+                            let _ = s.agent_activate(AccessMode::Read);
+                        },
+                    )
+                    .w_full(),
+                )
+                .child(
+                    action(
+                        "agent-enable-edit",
+                        "Enable edit access",
+                        p,
+                        false,
+                        |s, _| {
+                            let _ = s.agent_activate(AccessMode::Edit);
+                        },
+                    )
+                    .w_full(),
+                );
+        }
+        Some(AccessMode::Read) => {
+            controls = controls
+                .child(
+                    label(
+                        "Read access: the agent can discover the workspace and read the brief and image identity.",
+                        13.0,
+                        450.0,
+                        p.muted,
+                    )
+                    .wrap(),
+                )
+                .child(
+                    action("agent-allow-edits", "Allow edits", p, false, |s, _| {
+                        let _ = s.agent_activate(AccessMode::Edit);
+                    })
+                    .w_full(),
+                );
+        }
+        Some(AccessMode::Edit) => {
+            controls = controls
+                .child(
+                    label(
+                        "Edit access: the agent can select, compare, edit the brief and keep or remove references.",
+                        13.0,
+                        450.0,
+                        p.muted,
+                    )
+                    .wrap(),
+                )
+                .child(
+                    action("agent-read-only", "Switch to read only", p, false, |s, _| {
+                        let _ = s.agent_activate(AccessMode::Read);
+                    })
+                    .w_full(),
+                );
+        }
+    }
+    if access.mode().is_some() {
+        controls = controls
+            .child(
+                action("agent-copy-grant", "Copy grant path", p, true, |s, tx| {
+                    if let Some(path) = s.bridge.grant_path().and_then(Path::to_str) {
+                        tx.copy(path.to_owned());
+                        s.status =
+                            "Grant path copied. Share it only with the local agent you’ve chosen."
+                                .into();
+                    }
+                })
+                .w_full(),
+            )
+            .child(
+                action("agent-revoke", "Revoke access now", p, false, |s, _| {
+                    s.agent_revoke()
+                })
+                .w_full(),
+            );
+    }
+    col()
+        .key("agent-view")
+        .w_full()
+        .h_full()
+        .grow(1.0)
+        .padding(22.0)
+        .gap(14.0)
+        .child(label("Agent access", 36.0, 650.0, p.primary))
+        .child(
+            label(
+                "Share this brief, the archive and your selected or shortlisted local references with a local agent.",
+                14.0,
+                450.0,
+                p.muted,
+            )
+            .wrap(),
+        )
+        .child(
+            row()
+                .gap(10.0)
+                .items_center()
+                .child(label("Status", 12.0, 650.0, p.muted))
+                .child(label(state, 13.0, 650.0, state_color)),
+        )
+        .child(el().w_full().h(1.0).fill(p.line))
+        .child(controls)
+        .child(label(&s.status, 12.0, 500.0, p.muted).wrap())
+}
+
 fn drafting(s: &Studio, p: Ink) -> El {
     col()
         .key("draft-view")
@@ -1887,7 +2346,10 @@ fn drafting(s: &Studio, p: Ink) -> El {
                 .wrap()
                 .placeholder("Describe the image you want to make…", p.muted)
                 .on_edit(|s: &mut Studio| &mut s.draft)
-                .on_input_change(|s: &mut Studio, tx| s.working.pending(tx)),
+                .on_input_change(|s: &mut Studio, tx| {
+                    s.touch();
+                    s.working.pending(tx)
+                }),
         )
         .child(
             row()
@@ -1933,6 +2395,7 @@ fn view(s: &Studio, cx: &mut Cx<Studio>) -> El {
         Screen::Draft => shell = shell.child(drafting(s, p)),
         Screen::Connection => shell = shell.child(hosted::connection(s, p)),
         Screen::Hosted => shell = shell.child(hosted::library(s, p)),
+        Screen::Agent => shell = shell.child(agent_panel(s, p)),
         Screen::Preview | Screen::Compare(_) => unreachable!(),
     }
     shell.on_drop_files(|s: &mut Studio, paths, _| {
@@ -2008,7 +2471,7 @@ fn keyboard(s: &mut Studio, event: &KeyEvent, tx: &mut Tx) -> bool {
         Key::Enter
             if s.screen == Screen::Workspace && s.selected.is_some() && tx.focused().is_none() =>
         {
-            s.open_preview(tx)
+            s.open_preview(tx, "featured-image")
         }
         _ => return false,
     }
@@ -2016,6 +2479,14 @@ fn keyboard(s: &mut Studio, event: &KeyEvent, tx: &mut Tx) -> bool {
 }
 
 fn main() {
+    let arguments: Vec<_> = std::env::args_os().skip(1).collect();
+    if let Some(status) = agent_bridge::cli(&arguments) {
+        std::process::exit(status);
+    }
+    if let Err(error) = tooling_mode::prepare(arguments) {
+        eprintln!("Prints verification profile: {error}");
+        std::process::exit(2);
+    }
     rune::set_app_id(APP_ID);
     let _ = rune::set_app_icon(include_bytes!("../assets/icon.png").to_vec());
     let app = App::new(AppSpec {

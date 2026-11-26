@@ -2,7 +2,8 @@ use rune::{El, Tx, col, el, row};
 
 use crate::{Ink, Print, Screen, Studio, action, label, viewer};
 
-const CAMPAIGN_PRINTS: [&str; 2] = ["higher-than-before.jpg", "higher-than-before-poster.jpg"];
+pub(crate) const CAMPAIGN_PRINTS: [&str; 2] =
+    ["higher-than-before.jpg", "higher-than-before-poster.jpg"];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Pair {
@@ -10,16 +11,32 @@ pub(crate) enum Pair {
     Local(usize, usize),
 }
 
-fn open(s: &mut Studio, tx: &mut Tx, pair: Pair) {
+pub(crate) fn start(s: &mut Studio, pair: Pair) {
     s.viewer.reset();
     s.screen = Screen::Compare(pair);
+}
+
+fn open(s: &mut Studio, tx: &mut Tx, pair: Pair) {
+    start(s, pair);
     tx.focus("close-comparison", tx.by_keys() || tx.focus_visible());
 }
 
 pub(crate) fn return_to_workspace(s: &mut Studio, tx: &mut Tx) {
     let key = match s.screen {
         Screen::Compare(Pair::Campaign) => "compare-editions",
-        Screen::Compare(Pair::Local(..)) => "compare-local",
+        Screen::Compare(Pair::Local(..)) => {
+            match s.selected.and_then(|index| s.assets.get(index)) {
+                Some(asset) if asset.path().is_some() => "compare-local",
+                Some(asset)
+                    if asset
+                        .edition()
+                        .is_some_and(|edition| CAMPAIGN_PRINTS.contains(&edition.filename)) =>
+                {
+                    "compare-editions"
+                }
+                _ => "featured-image",
+            }
+        }
         _ => return,
     };
     s.screen = Screen::Workspace;
@@ -27,10 +44,10 @@ pub(crate) fn return_to_workspace(s: &mut Studio, tx: &mut Tx) {
 }
 
 fn first_local(s: &Studio) -> Option<usize> {
-    let path = s.comparison_first.as_deref()?;
+    let id = s.comparison_first.as_ref()?;
     s.assets
         .iter()
-        .position(|asset| asset.path() == Some(path) && asset.available())
+        .position(|asset| asset.id() == id && asset.available())
 }
 
 pub(crate) fn caption(s: &Studio, asset: &Print) -> String {
@@ -61,7 +78,8 @@ pub(crate) fn control(s: &Studio, asset: &Print, p: Ink) -> Option<El> {
         ));
     }
     let current = s.selected?;
-    let path = asset.path()?.to_path_buf();
+    asset.path()?;
+    let id = asset.id().clone();
     if !asset.available() {
         return None;
     }
@@ -72,13 +90,15 @@ pub(crate) fn control(s: &Studio, asset: &Print, p: Ink) -> Option<El> {
             p,
             false,
             move |s, tx| {
-                s.comparison_first = Some(path.clone());
+                s.comparison_first = Some(id.clone());
+                s.touch();
                 tx.focus("clear-comparison", tx.by_keys() || tx.focus_visible());
             },
         ),
         Some(first) if first == current => {
             action("clear-comparison", "Clear comparison", p, false, |s, tx| {
                 s.comparison_first = None;
+                s.touch();
                 tx.focus("choose-comparison", tx.by_keys() || tx.focus_visible());
             })
         }
