@@ -29,10 +29,12 @@ impl LocalImages {
         [
             self.originals.poll(originals, cache, |path, cache| {
                 let original = read_original(path)?;
+                let digest = blake3::hash(&original.bytes);
                 let picture = Picture::new(original.bytes, cache);
                 let _ = picture.image.wait();
                 Ok(OriginalImage {
                     picture,
+                    digest,
                     filename: original.filename,
                 })
             }),
@@ -69,6 +71,7 @@ impl LocalImages {
 
 pub(super) struct OriginalImage {
     pub picture: Picture,
+    pub digest: blake3::Hash,
     pub filename: String,
 }
 

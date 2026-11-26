@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::workspace::AssetId;
+use crate::{connected_asset::Provenance, workspace::AssetId};
 
 pub const MAX_REFS: usize = 300;
 pub const LIBRARY_KEY: &str = "linked-originals";
@@ -17,6 +17,10 @@ pub struct Reference {
     /// once, then kept across reorder, reopen and relocation.
     #[serde(default)]
     pub id: AssetId,
+    /// Identity of a hosted original this local file was deliberately copied
+    /// from, plus a digest to distinguish a later replacement at the same path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<Provenance>,
     #[serde(with = "native_path")]
     pub path: PathBuf,
     pub favourite: bool,
@@ -109,19 +113,23 @@ mod tests {
         assert!(old.favourite);
         assert!(!old.in_draft);
         assert!(old.id.is_empty());
+        assert!(old.provenance.is_none());
 
         let reference = Reference {
             id: AssetId::bundled("archive", "one.jpg"),
+            provenance: None,
             path: OsString::from_vec(b"/x\xff.jpg".to_vec()).into(),
             favourite: true,
             in_draft: true,
         };
         let encoded = serde_json::to_string(&reference).unwrap();
+        assert!(!encoded.contains("provenance"));
         let decoded: Reference = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded.path, reference.path);
         assert_eq!(decoded.id, reference.id);
         assert!(decoded.favourite);
         assert!(decoded.in_draft);
+        assert!(decoded.provenance.is_none());
     }
 
     #[test]
@@ -129,12 +137,14 @@ mod tests {
         let mut records = vec![
             Reference {
                 id: AssetId::default(),
+                provenance: None,
                 path: PathBuf::from("/first.jpg"),
                 favourite: false,
                 in_draft: true,
             },
             Reference {
                 id: AssetId::default(),
+                provenance: None,
                 path: PathBuf::from("/second.jpg"),
                 favourite: true,
                 in_draft: false,
