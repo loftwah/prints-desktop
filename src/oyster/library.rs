@@ -143,8 +143,13 @@ impl OysterClient {
         }
         let before = self.get_output(&expected.path)?;
         same_output(expected, &before)?;
-        let bytes =
-            self.download_matching_output(&expected.print.print_id, Some(&expected.path))?;
+        let bytes = self.download_observed(
+            &expected.print.print_id,
+            Some(&expected.path),
+            Some(expected.print.bytes),
+            None,
+            None,
+        )?;
         let after = self.get_output(&expected.path)?;
         same_output(expected, &after)?;
         if bytes.len() as u64 != expected.print.bytes {

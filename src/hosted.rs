@@ -82,8 +82,7 @@ struct Library {
     folders: Option<FolderPage>,
     page: OutputPage,
     selected: Option<usize>,
-    preview: Option<Image>,
-    last_export: Option<PathBuf>,
+    last_export: Option<(PathBuf, Option<Provenance>)>,
 }
 
 impl Library {
@@ -96,7 +95,6 @@ impl Library {
             folders: None,
             page: read.page,
             selected,
-            preview: None,
             last_export: None,
         }
     }
@@ -104,7 +102,6 @@ impl Library {
     fn show(&mut self, read: OutputRead, position: PagePosition) {
         self.folders = None;
         self.selected = (!read.page.items.is_empty()).then_some(0);
-        self.preview = None;
         self.page = read.page;
         self.position = position;
     }
@@ -166,7 +163,7 @@ enum Reply {
     Connected(Connection),
     Page(OutputRead),
     Folders(FolderPage),
-    Preview(Vec<u8>),
+    Preview(Identity, String, Vec<u8>),
     Forgotten,
 }
 
@@ -486,6 +483,7 @@ enum TransferState {
     Writing {
         pending: Pending,
         write: OriginalWrite,
+        provenance: Option<Provenance>,
     },
     Failed {
         capture: TransferCapture,
@@ -588,6 +586,10 @@ impl Hosted {
         self.catalogue_request.set_waker(wake.clone());
         self.transfer_request.set_waker(wake.clone());
         self.transfer_progress.set_waker(wake);
+    }
+
+    pub(super) fn set_status(&mut self, message: &str) {
+        self.status = message.into();
     }
 
     pub(super) fn connected(&self) -> bool {
@@ -1037,7 +1039,6 @@ impl Hosted {
             && index < library.page.items.len()
         {
             library.selected = Some(index);
-            library.preview = None;
             self.status.clear();
         }
     }
@@ -1061,7 +1062,7 @@ impl Hosted {
         let Some(item) = library.selected().cloned() else {
             return;
         };
-        if item.print.bytes > PREVIEW_BYTES {
+        if item.print.bytes > PREVIEW_BYTES || item.print.bytes == 0 {
             self.status = format!(
                 "This original exceeds the {} MiB limit.",
                 PREVIEW_BYTES / (1024 * 1024)
@@ -1083,12 +1084,12 @@ impl Hosted {
                     })
                     .and_then(|bytes| {
                         if previewable(&bytes) {
-                            Ok(Reply::Preview(bytes))
+                            Ok(Reply::Preview(Identity::new(&client, &item), filename(&item.path), bytes))
                         } else {
                             Err(Failure::local(
                                 report_operation,
                                 method,
-                                "This image format can be exported or opened in web Prints.",
+                                "This image exceeds the preview limits or uses an unsupported format. You can export it or open web Prints.",
                             ))
                         }
                     });
@@ -1345,9 +1346,47 @@ fn credential(profile: &Profile) -> Result<keyring::Entry, Failure> {
 }
 
 fn previewable(bytes: &[u8]) -> bool {
-    bytes.starts_with(b"\xff\xd8\xff")
-        || bytes.starts_with(b"\x89PNG\r\n\x1a\n")
-        || (bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP"))
+    use image::{ImageFormat, ImageReader};
+    let mut reader = match ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format() {
+        Ok(reader) => reader,
+        Err(_) => return false,
+    };
+    // Rune decodes animations once an Image is loaded. Only admit still
+    // formats here, with dimensions verified from the bytes before decoding.
+    match reader.format() {
+        Some(ImageFormat::Jpeg) => {}
+        Some(ImageFormat::Png) if !png_animated(bytes) => {}
+        Some(ImageFormat::WebP) if !webp_animated(bytes) => {}
+        _ => return false,
+    }
+    reader.no_limits();
+    reader.into_dimensions().is_ok_and(|(w, h)| {
+        w > 0 && h > 0 && w <= 8192 && h <= 8192 && u64::from(w) * u64::from(h) <= 16_000_000
+    })
+}
+
+fn png_animated(mut bytes: &[u8]) -> bool {
+    let Some(tail) = bytes.get(8..) else {
+        return true;
+    };
+    bytes = tail;
+    while bytes.len() >= 12 {
+        let size = u32::from_be_bytes(bytes[..4].try_into().unwrap()) as usize;
+        match &bytes[4..8] {
+            b"acTL" => return true,
+            b"IDAT" => return false,
+            _ => {}
+        }
+        let Some(tail) = size.checked_add(12).and_then(|size| bytes.get(size..)) else {
+            return true;
+        };
+        bytes = tail;
+    }
+    true
+}
+
+fn webp_animated(bytes: &[u8]) -> bool {
+    bytes.get(12..16) == Some(b"VP8X") && bytes.get(20).is_some_and(|flags| flags & 2 != 0)
 }
 
 fn filename(path: &str) -> String {
@@ -1373,6 +1412,7 @@ fn filename(path: &str) -> String {
 
 pub(super) fn poll(s: &mut Studio, _: f64, tx: &mut Tx) -> bool {
     let mut updated = false;
+    let was_connected = s.hosted.connected();
     // Discovery is polled first and on its own: an export dialog, a pending
     // write or a library reply cannot hide its completion.
     let catalogue = s.hosted.catalogue_request.take();
@@ -1402,10 +1442,15 @@ pub(super) fn poll(s: &mut Studio, _: f64, tx: &mut Tx) -> bool {
         _ => None,
     };
     if let Some(result) = written {
-        let pending = match std::mem::replace(&mut s.hosted.transfer, TransferState::Idle) {
-            TransferState::Writing { pending, .. } => pending,
-            _ => unreachable!(),
-        };
+        let (pending, provenance) =
+            match std::mem::replace(&mut s.hosted.transfer, TransferState::Idle) {
+                TransferState::Writing {
+                    pending,
+                    provenance,
+                    ..
+                } => (pending, provenance),
+                _ => unreachable!(),
+            };
         let (kind, detail) = match &result {
             Ok(_) => (TrailKind::Completed, "original written"),
             Err(_) => (TrailKind::Failed, "original write failed"),
@@ -1416,13 +1461,16 @@ pub(super) fn poll(s: &mut Studio, _: f64, tx: &mut Tx) -> bool {
         match result {
             Ok(path) => {
                 if let Some(library) = &mut s.hosted.library {
-                    library.last_export = Some(path);
+                    library.last_export = Some((path, provenance));
                 }
                 s.hosted.status = "Original exported.".into();
             }
             Err(_) => s.hosted.status = "Couldn't write the selected file.".into(),
         }
         updated = true;
+    }
+    if was_connected && !s.hosted.connected() {
+        s.lock_connected(tx);
     }
     updated
 }
@@ -1554,9 +1602,14 @@ fn apply_transfer(s: &mut Studio, tx: &mut Tx, envelope: TransferEnvelope) {
                     }
                     match result {
                         Ok(Some(path)) => {
-                            let (dialog, bytes) =
+                            let (capture, dialog, bytes) =
                                 match std::mem::replace(&mut h.transfer, TransferState::Idle) {
-                                    TransferState::Dialog { dialog, bytes, .. } => (dialog, bytes),
+                                    TransferState::Dialog {
+                                        capture,
+                                        dialog,
+                                        bytes,
+                                        ..
+                                    } => (capture, dialog, bytes),
                                     _ => return,
                                 };
                             h.log_event(
@@ -1576,6 +1629,19 @@ fn apply_transfer(s: &mut Studio, tx: &mut Tx, envelope: TransferEnvelope) {
                                 method: "local",
                             };
                             h.status = "Writing original…".into();
+                            let provenance = h
+                                .library
+                                .as_ref()
+                                .filter(|_| {
+                                    capture.item().print.kind == "image"
+                                        && bytes.len() as u64 <= MAX_IMPORT
+                                })
+                                .map(|library| {
+                                    Provenance::new(
+                                        Identity::new(&library.client, capture.item()),
+                                        &bytes,
+                                    )
+                                });
                             match OriginalWrite::start(path, bytes.into(), s.wake.clone()) {
                                 Ok(write) => {
                                     h.log_event(
@@ -1589,6 +1655,7 @@ fn apply_transfer(s: &mut Studio, tx: &mut Tx, envelope: TransferEnvelope) {
                                     h.transfer = TransferState::Writing {
                                         pending: write_pending,
                                         write,
+                                        provenance,
                                     };
                                 }
                                 Err(_) => {
@@ -1764,7 +1831,7 @@ fn apply_library(s: &mut Studio, tx: &mut Tx, envelope: Envelope) {
                 library.folders = Some(folders);
             }
         }
-        (Operation::Transfer(Transfer::Preview), Ok(Reply::Preview(bytes))) => {
+        (Operation::Transfer(Transfer::Preview), Ok(Reply::Preview(identity, filename, bytes))) => {
             h.log_event(
                 &pending,
                 Lane::Library,
@@ -1773,8 +1840,15 @@ fn apply_library(s: &mut Studio, tx: &mut Tx, envelope: Envelope) {
                 true,
                 "",
             );
-            if let (Some(library), Some(cache)) = (&mut h.library, &s.cache) {
-                library.preview = Some(cache.load(Arc::<[u8]>::from(bytes)));
+            if let Some(index) = s.accept_connected(identity, filename, bytes) {
+                s.hosted.set_status("Connected image ready to inspect.");
+                if s.screen == Screen::Hosted {
+                    s.selected = Some(index);
+                    tx.focus("hosted-full-view", tx.by_keys() || tx.focus_visible());
+                }
+            } else {
+                s.hosted
+                    .set_status("Close the comparison before loading another connected image.");
             }
         }
         (Operation::Forget, Ok(Reply::Forgotten)) => {
@@ -2020,7 +2094,10 @@ pub(super) fn connection(s: &Studio, p: Ink) -> El {
                 "Disconnect",
                 p,
                 false,
-                |s, _| s.hosted.disconnect(),
+                |s, tx| {
+                    s.hosted.disconnect();
+                    s.lock_connected(tx);
+                },
             ));
     } else if h.busy() {
         form = form.child(status(h, p));
@@ -2119,7 +2196,38 @@ pub(super) fn connection(s: &Studio, p: Ink) -> El {
         ))
 }
 
-fn asset_detail(h: &Hosted, library: &Library, item: &OutputItem, p: Ink) -> El {
+pub(super) fn reopen_reference(s: &mut Studio, identity: &Identity, tx: &mut Tx) {
+    let Some(library) = &s.hosted.library else {
+        s.hosted
+            .set_status("Connect to Prints to reopen this reference.");
+        s.screen = Screen::Connection;
+        tx.focus("oyster-origin", tx.by_keys() || tx.focus_visible());
+        return;
+    };
+    let index = library
+        .page
+        .items
+        .iter()
+        .position(|item| Identity::new(&library.client, item) == *identity);
+    s.screen = Screen::Hosted;
+    if let Some(index) = index {
+        s.hosted.select(index);
+        s.hosted
+            .set_status("Load the image preview to reopen this reference.");
+        tx.focus("hosted-preview", tx.by_keys() || tx.focus_visible());
+    } else {
+        s.hosted
+            .set_status("Find this reference in the connected Prints library to open it again.");
+        tx.blur();
+    }
+}
+
+fn asset_detail(s: &Studio, library: &Library, item: &OutputItem, p: Ink) -> El {
+    let h = &s.hosted;
+    let identity = Identity::new(&library.client, item);
+    let loaded = s
+        .hosted_index(&identity)
+        .filter(|&index| s.assets[index].available());
     let dimensions = match (item.print.width, item.print.height) {
         (Some(width), Some(height)) => format!("{width} × {height}"),
         _ => item
@@ -2156,7 +2264,8 @@ fn asset_detail(h: &Hosted, library: &Library, item: &OutputItem, p: Ink) -> El 
         }
         if item.print.kind == "image"
             && item.print.bytes <= PREVIEW_BYTES
-            && library.preview.is_none()
+            && item.print.bytes > 0
+            && loaded.is_none()
         {
             buttons = buttons.child(action(
                 "hosted-preview",
@@ -2164,6 +2273,19 @@ fn asset_detail(h: &Hosted, library: &Library, item: &OutputItem, p: Ink) -> El 
                 p,
                 false,
                 |s, _| s.hosted.transfer(Transfer::Preview),
+            ));
+        }
+        if let Some(index) = loaded {
+            buttons = buttons.child(action(
+                "hosted-full-view",
+                "Full view",
+                p,
+                true,
+                move |s, tx| {
+                    s.selected = Some(index);
+                    s.status.clear();
+                    s.open_preview(tx, "hosted-full-view");
+                },
             ));
         }
         if let Some(typed) = &item.typed {
@@ -2180,27 +2302,6 @@ fn asset_detail(h: &Hosted, library: &Library, item: &OutputItem, p: Ink) -> El 
             ));
         }
         detail = detail.child(buttons);
-    }
-    if let Some(image) = &library.preview {
-        let mut panel = el().w_full().h(280.0).fill(p.stage).clip_rounded(9.0);
-        panel = if image.is_ready() {
-            panel.pixels_fit(image.pixels(), SurfaceFit::Fit)
-        } else if image.error().is_some() {
-            panel.center().child(
-                label(
-                    "Preview unavailable. You can still export the original.",
-                    13.0,
-                    500.0,
-                    p.muted,
-                )
-                .wrap(),
-            )
-        } else {
-            panel
-                .center()
-                .child(label("Decoding preview…", 13.0, 500.0, p.muted))
-        };
-        detail = detail.child(panel);
     }
     if let Some(style) = &item.style {
         detail = detail.child(label(format!("Style · {style}"), 13.0, 500.0, p.muted).wrap());
@@ -2378,7 +2479,7 @@ pub(super) fn library(s: &Studio, p: Ink) -> El {
     }
     let mut detail = col().w_full().min_w(0.0).gap(12.0);
     if let Some(item) = library.selected() {
-        detail = detail.child(asset_detail(h, library, item, p));
+        detail = detail.child(asset_detail(s, library, item, p));
     }
     let mut catalogue = col()
         .w_full()
@@ -2448,9 +2549,21 @@ pub(super) fn library(s: &Studio, p: Ink) -> El {
         .gap(10.0)
         .items_center()
         .child(status(h, p).grow(1.0).shrink().min_w(0.0));
-    let mut status_row = if let Some(path) = &library.last_export {
+    let mut status_row = if let Some((path, provenance)) = &library.last_export {
         let path = path.clone();
-        status_row.child(action(
+        let mut controls = status_row;
+        if let Some(provenance) = provenance {
+            let copy = path.clone();
+            let provenance = provenance.clone();
+            controls = controls.child(action(
+                "hosted-keep-copy",
+                "Link exported image",
+                p,
+                false,
+                move |s, tx| s.keep_local_copy(copy.clone(), provenance.clone(), tx),
+            ));
+        }
+        controls.child(action(
             "hosted-reveal",
             "Show last export",
             p,

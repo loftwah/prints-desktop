@@ -579,6 +579,9 @@ impl OysterClient {
             if new_len > MAX_DOWNLOAD_BYTES {
                 return Err(Error::TooLarge);
             }
+            if total.is_some_and(|expected| new_len as u64 > expected) {
+                return Err(Error::Decode);
+            }
             out.extend_from_slice(&bytes);
             offset += bytes.len() as u64;
             if let Some(report) = on_progress.as_deref_mut() {

@@ -10,6 +10,8 @@ use std::sync::Arc;
 mod agent_bridge;
 mod archive;
 mod comparison;
+mod connected_asset;
+use connected_asset::{Identity, Provenance};
 mod disk;
 use disk::OriginalWrite;
 mod draft;
@@ -123,7 +125,14 @@ impl Picture {
 enum Original {
     Afterlight(&'static Study, Picture),
     Edition(&'static archive::Edition, Picture),
-    Linked { path: PathBuf, available: bool },
+    Linked {
+        path: PathBuf,
+        available: bool,
+    },
+    Hosted {
+        identity: Identity,
+        picture: Option<Picture>,
+    },
 }
 
 struct Print {
@@ -132,6 +141,7 @@ struct Print {
     filename: String,
     find: String,
     original: Original,
+    provenance: Option<Provenance>,
 }
 
 impl Print {
@@ -140,7 +150,7 @@ impl Print {
         match &original {
             Original::Afterlight(study, _) => fields.extend([study.note, study.prompt]),
             Original::Edition(edition, _) => fields.extend([edition.note, edition.source]),
-            Original::Linked { .. } => (),
+            Original::Linked { .. } | Original::Hosted { .. } => (),
         }
         let find = fields.join("\n").to_lowercase();
         Self {
@@ -149,6 +159,7 @@ impl Print {
             filename,
             find,
             original,
+            provenance: None,
         }
     }
 
@@ -170,6 +181,29 @@ impl Print {
             },
             id,
         )
+    }
+
+    fn locked(identity: Identity, id: AssetId) -> Self {
+        Self::new(
+            format!("Connected print · {}", &id.as_str()[7..13]),
+            String::new(),
+            Original::Hosted {
+                identity,
+                picture: None,
+            },
+            id,
+        )
+    }
+
+    fn connected(&self) -> Option<&Identity> {
+        match &self.original {
+            Original::Hosted { identity, .. } => Some(identity),
+            _ => None,
+        }
+    }
+
+    fn provenance(&self) -> Option<&Provenance> {
+        self.provenance.as_ref()
     }
 
     fn id(&self) -> &AssetId {
@@ -200,6 +234,7 @@ impl Print {
     fn picture(&self) -> Option<&Picture> {
         match &self.original {
             Original::Afterlight(_, picture) | Original::Edition(_, picture) => Some(picture),
+            Original::Hosted { picture, .. } => picture.as_ref(),
             Original::Linked { .. } => None,
         }
     }
@@ -210,7 +245,7 @@ impl Print {
             Original::Linked {
                 available: false,
                 ..
-            }
+            } | Original::Hosted { picture: None, .. }
         )
     }
 
@@ -218,6 +253,7 @@ impl Print {
         match &self.original {
             Original::Afterlight(study, _) => study.note,
             Original::Edition(edition, _) => edition.source,
+            Original::Hosted { .. } => "Connected Prints original",
             Original::Linked {
                 available: true, ..
             } => "Linked original on this device.",
@@ -268,6 +304,7 @@ struct Studio {
     assets: Vec<Print>,
     selected: Option<usize>,
     comparison_first: Option<AssetId>,
+    comparison_return: Option<Screen>,
     human_edits: u64,
     ids_migrated: bool,
     agent: AgentAccess,
@@ -293,7 +330,7 @@ struct Studio {
     proof: bool,
     hosted: hosted::Hosted,
     viewer: viewer::Viewer,
-    preview_return: Option<String>,
+    preview_return: Option<(Screen, String)>,
 }
 
 impl Studio {
@@ -332,6 +369,7 @@ impl Studio {
             assets: Vec::new(),
             selected: Some(AFTERLIGHT.len()),
             comparison_first: None,
+            comparison_return: None,
             human_edits: 0,
             ids_migrated: false,
             agent: AgentAccess::off(working.workspace_id.clone()),
@@ -417,12 +455,177 @@ impl Studio {
             if shortlist.is_none() && record.in_draft {
                 self.draft_shortlist.push(self.assets.len());
             }
-            self.assets
-                .push(Print::linked(record.path, None, record.id));
+            let mut print = Print::linked(record.path, None, record.id);
+            print.provenance = record.provenance;
+            self.assets.push(print);
         }
         if let Some(entries) = shortlist {
             self.draft_shortlist = draft::resolve(&self.assets, &entries);
         }
+    }
+
+    fn keep_local_copy(&mut self, path: PathBuf, provenance: Provenance, tx: &mut Tx) {
+        self.open_local_library();
+        let Some(path) = local::canonical(&path) else {
+            self.hosted
+                .set_status("The exported file is no longer available.");
+            return;
+        };
+        let index = if let Some(index) = self.assets.iter().position(|p| p.path() == Some(&path)) {
+            self.local_images.invalidate(&path);
+            index
+        } else {
+            if self.refs().count() >= local::MAX_REFS {
+                self.hosted.set_status(
+                    "The local library is full. The exported original is still on disk.",
+                );
+                return;
+            }
+            let used = self
+                .assets
+                .iter()
+                .map(|asset| asset.id().as_str().to_owned())
+                .collect();
+            let index = self.assets.len();
+            self.assets
+                .push(Print::linked(path, None, AssetId::fresh(&used)));
+            index
+        };
+        self.assets[index].provenance = Some(provenance);
+        self.touch();
+        if self.persist_local() {
+            self.show_shelf(Shelf::Imports);
+            self.selected = Some(index);
+            self.reveal_selection(tx);
+            tx.focus("featured-image", tx.by_keys() || tx.focus_visible());
+            self.status = "Exported original linked to the local library.".into();
+        } else {
+            self.hosted
+                .set_status("The original is on disk. Its local link could not be saved.");
+        }
+    }
+
+    fn hosted_index(&self, identity: &Identity) -> Option<usize> {
+        self.assets
+            .iter()
+            .position(|asset| asset.connected() == Some(identity))
+    }
+
+    /// Keep at most three decoded connected images. Keep the active pair and
+    /// draft identities while replacing unused temporary slots.
+    fn accept_connected(
+        &mut self,
+        identity: Identity,
+        filename: String,
+        bytes: Vec<u8>,
+    ) -> Option<usize> {
+        let cache = self.cache.as_ref()?;
+        let existing = self.hosted_index(&identity);
+        let staged = self.comparison_first.as_ref();
+        let pair = self.comparison_assets();
+        let protected = |index: usize, print: &Print| {
+            self.selected == Some(index)
+                || staged == Some(print.id())
+                || pair.is_some_and(|indices| indices.contains(&index))
+        };
+        let resident = self
+            .assets
+            .iter()
+            .filter(|asset| asset.connected().is_some() && asset.available())
+            .count();
+        if resident >= 3 && !existing.is_some_and(|index| self.assets[index].available()) {
+            let index = self
+                .assets
+                .iter()
+                .enumerate()
+                .find(|(index, asset)| {
+                    asset.connected().is_some() && asset.available() && !protected(*index, asset)
+                })
+                .map(|(index, _)| index)?;
+            let asset = &self.assets[index];
+            self.assets[index] = Print::locked(asset.connected()?.clone(), asset.id().clone());
+        }
+        let id = identity.id(&self.working.workspace_id);
+        let print = Print::new(
+            filename.clone(),
+            filename,
+            Original::Hosted {
+                identity,
+                picture: Some(Picture::new(bytes.into(), cache)),
+            },
+            id,
+        );
+        let index = existing.or_else(|| {
+            self.assets.iter().enumerate().position(|(index, asset)| {
+                asset.connected().is_some()
+                    && !asset.available()
+                    && !protected(index, asset)
+                    && !self.draft_shortlist.contains(&index)
+            })
+        });
+        let index = if let Some(index) = index {
+            self.assets[index] = print;
+            index
+        } else {
+            self.assets.push(print);
+            self.assets.len() - 1
+        };
+        self.touch();
+        Some(index)
+    }
+
+    fn lock_connected(&mut self, tx: &mut Tx) {
+        let is_connected = |index: usize| {
+            self.assets
+                .get(index)
+                .is_some_and(|p| p.connected().is_some())
+        };
+        let viewing = matches!(self.screen, Screen::Preview)
+            && self.selected.is_some_and(is_connected)
+            || self
+                .comparison_assets()
+                .is_some_and(|pair| pair.into_iter().any(is_connected));
+        if self.selected.is_some_and(is_connected) {
+            self.selected = None;
+        }
+        if self.comparison_first.as_ref().is_some_and(|id| {
+            self.assets
+                .iter()
+                .any(|asset| asset.id() == id && asset.connected().is_some())
+        }) {
+            self.comparison_first = None;
+        }
+        let mut changed = false;
+        for asset in &mut self.assets {
+            if let Some(identity) = asset.connected()
+                && asset.available()
+            {
+                *asset = Print::locked(identity.clone(), asset.id().clone());
+                changed = true;
+            }
+        }
+        if viewing {
+            self.preview_return = None;
+            self.comparison_return = None;
+            self.screen = Screen::Connection;
+            self.viewer.reset();
+            tx.blur();
+        }
+        if changed {
+            self.touch();
+        }
+    }
+
+    fn open_connected_reference(&mut self, index: usize, tx: &mut Tx) {
+        if self.assets[index].available() {
+            self.selected = Some(index);
+            self.open_preview(tx, &format!("draft-open-{index}"));
+            return;
+        }
+        let Some(identity) = self.assets[index].connected().cloned() else {
+            return;
+        };
+        hosted::reopen_reference(self, &identity, tx);
     }
 
     fn original<'a>(&'a self, asset: &'a Print) -> Option<&'a Picture> {
@@ -563,9 +766,9 @@ impl Studio {
 
     /// Enter full view, remembering the control that initiated it so the return can restore that
     /// focus instead of dropping it.
-    fn open_preview(&mut self, tx: &mut Tx, return_to: &'static str) {
+    fn open_preview(&mut self, tx: &mut Tx, return_to: &str) {
         if self.screen != Screen::Preview {
-            self.preview_return = Some(return_to.into());
+            self.preview_return = Some((self.screen, return_to.into()));
             self.viewer.reset();
         }
         self.screen = Screen::Preview;
@@ -574,15 +777,24 @@ impl Studio {
 
     /// Return from full view with the initiating focus restored.
     fn close_preview(&mut self, tx: &mut Tx) {
-        self.screen = Screen::Workspace;
-        if let Some(key) = self.preview_return.take() {
+        if let Some((screen, key)) = self.preview_return.take() {
+            self.screen = screen;
             tx.focus(key, tx.by_keys() || tx.focus_visible());
         } else {
+            self.screen = Screen::Workspace;
             tx.blur();
         }
     }
 
     fn step(&mut self, direction: isize) {
+        if self.screen == Screen::Preview
+            && self
+                .selected
+                .and_then(|index| self.assets[index].connected())
+                .is_some()
+        {
+            return;
+        }
         let list = self.visible();
         if list.is_empty() {
             return;
@@ -751,7 +963,9 @@ impl Studio {
             Ok(filename) => {
                 let id = self.assets[index].id().clone();
                 self.local_images.invalidate(path);
-                self.assets[index] = Print::linked(path.to_path_buf(), Some(filename), id);
+                let mut print = Print::linked(path.to_path_buf(), Some(filename), id);
+                print.provenance = self.assets[index].provenance.clone();
+                self.assets[index] = print;
                 self.sync_selection();
                 self.focus_after_recovery(index, tx);
                 self.status = "Original refreshed.".into();
@@ -791,7 +1005,9 @@ impl Studio {
                 let id = self.assets[index].id().clone();
                 self.local_images.invalidate(previous);
                 self.touch();
-                self.assets[index] = Print::linked(source, Some(filename), id);
+                let mut print = Print::linked(source, Some(filename), id);
+                print.provenance = self.assets[index].provenance.clone();
+                self.assets[index] = print;
                 self.sync_selection();
                 self.focus_after_recovery(index, tx);
                 if self.persist_local() {
@@ -929,12 +1145,18 @@ impl Studio {
         let compare_first = self.comparison_first.as_ref() == Some(print.id())
             || active_pair.is_some_and(|[first, _]| first == index);
         let compare_second = active_pair.is_some_and(|[_, second]| second == index);
-        if print.path().is_some() && !(selected || in_brief || compare_first || compare_second) {
+        if (print.path().is_some() || print.connected().is_some())
+            && !(selected || in_brief || compare_first || compare_second)
+        {
             return None;
         }
         Some(workspace::AssetView {
             id: print.id().clone(),
-            title: print.title.chars().take(140).collect(),
+            title: if print.connected().is_some() {
+                "Connected print".into()
+            } else {
+                print.title.chars().take(140).collect()
+            },
             selected,
             in_brief,
             comparable: print.available(),
@@ -945,6 +1167,11 @@ impl Studio {
 
     fn show_agent_asset(&mut self, index: usize) {
         let print = &self.assets[index];
+        if print.connected().is_some() {
+            self.screen = Screen::Hosted;
+            self.selected = Some(index);
+            return;
+        }
         let shelf = if print.path().is_some() {
             Shelf::Imports
         } else if print.study().is_some() {
@@ -1063,23 +1290,42 @@ impl Surface for Studio {
 
     fn select(&mut self, id: &AssetId) -> Result<workspace::Change, Fault> {
         let index = self.asset_index(id).ok_or(Fault::NotFound)?;
+        if self.assets[index].connected().is_some() && !self.assets[index].available() {
+            return Err(Fault::Unavailable);
+        }
         if self.selected == Some(index) && self.screen == Screen::Workspace {
             return Ok(workspace::Change::Unchanged(
                 "That image is already selected.",
             ));
         }
-        self.show_agent_asset(index);
+        if self.assets[index].connected().is_some() {
+            self.preview_return = Some((Screen::Hosted, "hosted-full-view".into()));
+            self.selected = Some(index);
+            self.screen = Screen::Preview;
+            self.viewer.reset();
+            self.agent_focus = Some("close-preview".into());
+        } else {
+            self.show_agent_asset(index);
+            self.agent_focus = Some("featured-image".into());
+        }
         self.status.clear();
-        self.agent_focus = Some("featured-image".into());
         Ok(workspace::Change::Applied)
     }
 
     fn compare(&mut self, first: &AssetId, second: &AssetId) -> Result<workspace::Change, Fault> {
         let first_index = self.asset_index(first).ok_or(Fault::NotFound)?;
         let second_index = self.asset_index(second).ok_or(Fault::NotFound)?;
+        if [first_index, second_index].iter().any(|&index| {
+            self.assets[index].connected().is_some() && !self.assets[index].available()
+        }) {
+            return Err(Fault::Unavailable);
+        }
         self.show_agent_asset(second_index);
         self.comparison_first = Some(first.clone());
         comparison::start(self, comparison::Pair::Local(first_index, second_index));
+        if self.assets[second_index].connected().is_some() {
+            self.comparison_return = Some(Screen::Hosted);
+        }
         self.agent_focus = Some("close-comparison".into());
         Ok(workspace::Change::Applied)
     }
@@ -1762,6 +2008,33 @@ fn inspector(s: &Studio, asset: &Print, p: Ink) -> El {
         .child(label(dimensions, 12.0, 500.0, p.muted).truncate_middle())
         .child(el().w_full().h(1.0).fill(p.line))
         .child(label(source, 12.0, 550.0, p.muted));
+    if let Some(provenance) = asset.provenance()
+        && let Some(image) = asset.path().and_then(|path| s.local_images.original(path))
+    {
+        details = if provenance.matches(&image.digest) {
+            details
+                .child(
+                    label(
+                        "From Prints · Exact exported original",
+                        12.0,
+                        550.0,
+                        p.muted,
+                    )
+                    .wrap(),
+                )
+                .child(label(provenance.source.label(), 12.0, 500.0, p.muted).truncate_middle())
+        } else {
+            details.child(
+                label(
+                    "This file differs from the Prints original.",
+                    12.0,
+                    550.0,
+                    p.muted,
+                )
+                .wrap(),
+            )
+        };
+    }
     if let Some(study) = asset.study() {
         details = details
             .child(label("Creative brief", 13.0, 650.0, p.primary))
@@ -2130,13 +2403,26 @@ fn fullscreen(s: &Studio, p: Ink) -> El {
     let Some(asset) = s.selected.and_then(|i| s.assets.get(i)) else {
         return workspace(s, p);
     };
-    let close = action(
-        "close-preview",
-        "Back to contact sheet",
-        p,
-        false,
-        Studio::close_preview,
-    );
+    let connected = asset.connected().is_some();
+    let back = match s.preview_return.as_ref().map(|(screen, _)| screen) {
+        Some(Screen::Hosted) => "Back to Prints library",
+        Some(Screen::Draft) => "Back to draft",
+        _ => "Back to contact sheet",
+    };
+    let close = action("close-preview", back, p, false, Studio::close_preview);
+    let mut controls = row().w_full().gap(8.0).items_center();
+    if connected {
+        controls = controls
+            .child(draft::action_for_selection(s, p))
+            .children(comparison::control(s, asset, p));
+    } else {
+        controls = controls
+            .child(action("previous-print", "Previous", p, false, |s, _| {
+                s.step(-1)
+            }))
+            .child(action("next-print", "Next", p, false, |s, _| s.step(1)))
+            .child(export_action(s, "export-preview", p));
+    }
     col()
         .key("full-view")
         .w_full()
@@ -2165,28 +2451,22 @@ fn fullscreen(s: &Studio, p: Ink) -> El {
             0,
         )))
         .child(
-            row()
-                .w_full()
-                .gap(8.0)
-                .items_center()
-                .child(action("previous-print", "Previous", p, false, |s, _| {
-                    s.step(-1)
-                }))
-                .child(action("next-print", "Next", p, false, |s, _| s.step(1)))
-                .child(
-                    label(
-                        if s.status.is_empty() {
-                            "Arrow keys to browse  ·  Esc to close"
-                        } else {
-                            &s.status
-                        },
-                        12.0,
-                        470.0,
-                        p.muted,
-                    )
-                    .grow(1.0),
+            controls.child(
+                label(
+                    if !s.status.is_empty() {
+                        &s.status
+                    } else if connected {
+                        "From your connected Prints library  ·  Esc to close"
+                    } else {
+                        "Arrow keys to browse  ·  Esc to close"
+                    },
+                    12.0,
+                    470.0,
+                    p.muted,
                 )
-                .child(export_action(s, "export-preview", p)),
+                .grow(1.0)
+                .wrap(),
+            ),
         )
 }
 

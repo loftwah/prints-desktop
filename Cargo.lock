@@ -2837,10 +2837,12 @@ checksum = "e8cf8e6a8aa66ce33f63993ffc4ea4271eb5b0530a9002db8455ea6050c77bfa"
 
 [[package]]
 name = "prints-desktop"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "base64 0.22.1",
+ "blake3",
  "getrandom 0.4.3",
+ "image",
  "keyring",
  "reqwest",
  "rpassword",

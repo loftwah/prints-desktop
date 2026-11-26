@@ -1,9 +1,9 @@
-use std::path::Path;
-
 use rune::{El, ScrollSpec, Tx, col, row};
 
 use crate::{
-    Ink, Print, Shelf, Studio, action, label,
+    Ink, Print, Shelf, Studio, action,
+    connected_asset::Identity,
+    label,
     workspace::{AssetId, WorkspaceId},
 };
 
@@ -24,6 +24,9 @@ pub(crate) struct DraftAsset {
 enum DraftKind {
     Bundled(String),
     Linked(#[serde(with = "crate::local::native_path")] std::path::PathBuf),
+    /// A hosted original is identified by opaque provenance, never by a path
+    /// or a display name. The flattened tag keeps older snapshots readable.
+    Hosted(Identity),
 }
 
 impl DraftAsset {
@@ -41,17 +44,10 @@ impl DraftAsset {
         }
     }
 
-    fn name(&self) -> Option<&str> {
-        match &self.kind {
-            DraftKind::Bundled(name) => Some(name),
-            DraftKind::Linked(_) => None,
-        }
-    }
-
-    fn path(&self) -> Option<&Path> {
-        match &self.kind {
-            DraftKind::Bundled(_) => None,
-            DraftKind::Linked(path) => Some(path),
+    fn hosted(identity: Identity, id: AssetId) -> Self {
+        Self {
+            id,
+            kind: DraftKind::Hosted(identity),
         }
     }
 }
@@ -165,7 +161,10 @@ pub(crate) fn restore_bundled(studio: &mut Studio) -> bool {
                 let id = studio
                     .assets
                     .iter()
-                    .find(|print| print.path().is_none() && print.filename == name)
+                    .find(|print| {
+                        (print.edition().is_some() || print.study().is_some())
+                            && print.filename == name
+                    })
                     .map_or_else(
                         || AssetId::bundled("legacy", &name),
                         |print| print.id().clone(),
@@ -174,7 +173,24 @@ pub(crate) fn restore_bundled(studio: &mut Studio) -> bool {
             })
             .collect()
     };
+    // Saved hosted entries need a placeholder before the shortlist is resolved.
+    // Append in entry order so bundled and local indices never shift.
     let mut migrated = false;
+    for entry in entries.iter_mut().take(SHORTLIST_LIMIT) {
+        if let DraftKind::Hosted(identity) = &entry.kind {
+            let id = identity.id(&studio.working.workspace_id);
+            migrated |= entry.id != id;
+            entry.id = id;
+        }
+        if let DraftKind::Hosted(identity) = &entry.kind
+            && !entry.id.is_empty()
+            && !studio.assets.iter().any(|print| print.id() == &entry.id)
+        {
+            studio
+                .assets
+                .push(Print::locked(identity.clone(), entry.id.clone()));
+        }
+    }
     for entry in &mut entries {
         if entry.id.is_empty()
             && let Some(index) = resolve_one(&studio.assets, entry)
@@ -184,6 +200,9 @@ pub(crate) fn restore_bundled(studio: &mut Studio) -> bool {
         }
     }
     studio.draft_shortlist = resolve(&studio.assets, &entries);
+    if let Some(saved) = &mut studio.working.loaded {
+        saved.shortlist = entries;
+    }
     migrated
 }
 
@@ -191,15 +210,13 @@ fn resolve_one(assets: &[Print], entry: &DraftAsset) -> Option<usize> {
     if !entry.id.is_empty() {
         return assets.iter().position(|print| print.id() == &entry.id);
     }
-    assets.iter().position(|print| match entry {
-        DraftAsset {
-            kind: DraftKind::Bundled(name),
-            ..
-        } => print.path().is_none() && print.filename == *name,
-        DraftAsset {
-            kind: DraftKind::Linked(path),
-            ..
-        } => print.path() == Some(path.as_path()),
+    assets.iter().position(|print| match &entry.kind {
+        DraftKind::Bundled(name) => {
+            (print.edition().is_some() || print.study().is_some()) && print.filename == *name
+        }
+        DraftKind::Linked(path) => print.path() == Some(path.as_path()),
+        // An id-less hosted entry has no safe fallback: identities are opaque.
+        DraftKind::Hosted(_) => false,
     })
 }
 
@@ -225,6 +242,7 @@ pub(crate) fn persist(studio: &mut Studio) -> bool {
         .filter_map(|(index, image)| {
             Some(crate::local::Reference {
                 id: image.id().clone(),
+                provenance: image.provenance().cloned(),
                 path: image.path()?.to_path_buf(),
                 favourite: studio.favourites.contains(&index),
                 in_draft: false,
@@ -236,6 +254,9 @@ pub(crate) fn persist(studio: &mut Studio) -> bool {
         .iter()
         .filter_map(|&index| {
             let print = studio.assets.get(index)?;
+            if let Some(identity) = print.connected() {
+                return Some(DraftAsset::hosted(identity.clone(), print.id().clone()));
+            }
             Some(print.path().map_or_else(
                 || DraftAsset::bundled(print.filename.clone(), print.id().clone()),
                 |path| DraftAsset::linked(path.to_path_buf(), print.id().clone()),
@@ -321,6 +342,16 @@ pub(crate) fn forget_asset(studio: &mut Studio, index: usize) -> bool {
 }
 
 fn open(studio: &mut Studio, index: usize, tx: &mut Tx) {
+    // Hosted prints (live or locked placeholders) are opened through the
+    // connected handoff. It owns the available/full and reconnect status.
+    if studio
+        .assets
+        .get(index)
+        .is_some_and(|print| print.connected().is_some())
+    {
+        studio.open_connected_reference(index, tx);
+        return;
+    }
     let Some(print) = studio.assets.get(index) else {
         return;
     };
@@ -389,6 +420,8 @@ pub(crate) fn shortlist(studio: &Studio, ink: Ink) -> El {
 }
 
 fn shortlist_row(print: &Print, index: usize, ink: Ink) -> El {
+    // Locked hosted placeholders carry generic names, so the title shown here
+    // is safe text and the existing Open/Remove controls stay available.
     row()
         .w_full()
         .gap(8.0)
@@ -403,7 +436,11 @@ fn shortlist_row(print: &Print, index: usize, ink: Ink) -> El {
         .child(
             action(
                 &format!("draft-open-{index}"),
-                "Open",
+                if print.connected().is_some() && !print.available() {
+                    "Find in Prints"
+                } else {
+                    "Open"
+                },
                 ink,
                 false,
                 move |studio, tx| {

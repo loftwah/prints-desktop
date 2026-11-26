@@ -32,6 +32,32 @@ Its model catalogue returned HTTP 502. The desktop opens the readable library
 first and treats model discovery as optional; it offers web Prints for folder
 navigation.
 
+## Compare a connected print and keep its source
+
+Select an image and choose **Load image preview**, then **Full view**. The
+desktop opens its usual Fit and 100% viewer. Choose **Keep with draft** or **Set
+first image**. To compare it with another image, go back, open the Creative
+Archive or Local imports, pick your second image and choose **Compare images**.
+The viewer holds up to three recently loaded connected stills. The preview
+supports JPEG, PNG and WebP stills up to 8 MiB and 16 megapixels.
+
+A draft retains the reference after closing and shows a generic label while
+it is locked. Reconnect, choose **Find in Prints** and explicitly load the
+preview again. If the print has moved or is on another page, browse to its
+current location. The reference follows the original record in the same
+host, installation and Computer. A different Computer or replacement record
+needs its own shortlist entry. Disconnect or a refused credential clears the
+loaded private previews. The opted-in local agent surface shares permitted
+reference IDs and comparison state without the connected key, prompt, path
+or image bytes.
+
+**Export original** writes the exact upstream bytes. The file can retain
+embedded prompt, lineage or signed metadata. After choosing the destination,
+use **Link exported image** to keep it in Local imports with its Prints source.
+The link remains usable offline and the inspector reports when the bytes no
+longer match. The draft shortlist is local. Use web Prints for generation,
+folder moves and team favourites.
+
 ## Optional model discovery and local report
 
 `listOutputs` opens the library on its own. `listModels` then runs on a

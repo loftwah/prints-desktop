@@ -13,20 +13,40 @@ pub(crate) enum Pair {
 
 pub(crate) fn start(s: &mut Studio, pair: Pair) {
     s.viewer.reset();
+    s.comparison_return = None;
     s.screen = Screen::Compare(pair);
 }
 
 fn open(s: &mut Studio, tx: &mut Tx, pair: Pair) {
+    let origin = s.screen;
     start(s, pair);
+    if matches!(origin, Screen::Preview | Screen::Hosted) {
+        s.comparison_return = Some(origin);
+    }
     tx.focus("close-comparison", tx.by_keys() || tx.focus_visible());
 }
 
 pub(crate) fn return_to_workspace(s: &mut Studio, tx: &mut Tx) {
+    if let Some(origin) = s.comparison_return.take() {
+        s.screen = origin;
+        s.viewer.reset();
+        tx.focus(
+            if origin == Screen::Preview {
+                "compare-local"
+            } else {
+                "hosted-full-view"
+            },
+            tx.by_keys() || tx.focus_visible(),
+        );
+        return;
+    }
     let key = match s.screen {
         Screen::Compare(Pair::Campaign) => "compare-editions",
         Screen::Compare(Pair::Local(..)) => {
             match s.selected.and_then(|index| s.assets.get(index)) {
-                Some(asset) if asset.path().is_some() => "compare-local",
+                Some(asset) if asset.path().is_some() || first_local(s).is_some() => {
+                    "compare-local"
+                }
                 Some(asset)
                     if asset
                         .edition()
@@ -51,8 +71,7 @@ fn first_local(s: &Studio) -> Option<usize> {
 }
 
 pub(crate) fn caption(s: &Studio, asset: &Print) -> String {
-    if asset.path().is_some()
-        && asset.available()
+    if asset.available()
         && let Some(first) = first_local(s)
     {
         return if s.selected == Some(first) {
@@ -65,9 +84,11 @@ pub(crate) fn caption(s: &Studio, asset: &Print) -> String {
 }
 
 pub(crate) fn control(s: &Studio, asset: &Print, p: Ink) -> Option<El> {
-    if asset
-        .edition()
-        .is_some_and(|edition| CAMPAIGN_PRINTS.contains(&edition.filename))
+    let first = first_local(s);
+    if first.is_none()
+        && asset
+            .edition()
+            .is_some_and(|edition| CAMPAIGN_PRINTS.contains(&edition.filename))
     {
         return Some(action(
             "compare-editions",
@@ -78,12 +99,14 @@ pub(crate) fn control(s: &Studio, asset: &Print, p: Ink) -> Option<El> {
         ));
     }
     let current = s.selected?;
-    asset.path()?;
+    if first.is_none() && asset.path().is_none() && asset.connected().is_none() {
+        return None;
+    }
     let id = asset.id().clone();
     if !asset.available() {
         return None;
     }
-    let button = match first_local(s) {
+    let button = match first {
         None => action(
             "choose-comparison",
             "Set first image",
@@ -92,12 +115,19 @@ pub(crate) fn control(s: &Studio, asset: &Print, p: Ink) -> Option<El> {
             move |s, tx| {
                 s.comparison_first = Some(id.clone());
                 s.touch();
+                if s.selected
+                    .is_some_and(|index| s.assets[index].connected().is_some())
+                {
+                    s.status =
+                        "Choose a second image in Archive, Local imports or Prints library.".into();
+                }
                 tx.focus("clear-comparison", tx.by_keys() || tx.focus_visible());
             },
         ),
         Some(first) if first == current => {
             action("clear-comparison", "Clear comparison", p, false, |s, tx| {
                 s.comparison_first = None;
+                s.status.clear();
                 s.touch();
                 tx.focus("choose-comparison", tx.by_keys() || tx.focus_visible());
             })

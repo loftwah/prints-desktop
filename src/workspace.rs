@@ -47,6 +47,10 @@ impl AssetId {
         )
     }
 
+    pub(crate) fn hosted(digest: &str) -> Self {
+        Self(format!("hosted:{digest}"))
+    }
+
     /// Path-free id for a legacy reference with no stored id. The counter only
     /// avoids collisions inside this workspace; it is not a secret.
     pub(crate) fn migrated(used: &HashSet<String>, seed: usize) -> Self {
@@ -149,15 +153,6 @@ pub(crate) struct EntropyUnavailable;
 pub(crate) enum AccessMode {
     Read,
     Edit,
-}
-
-impl AccessMode {
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            Self::Read => "Read only",
-            Self::Edit => "Can edit",
-        }
-    }
 }
 
 /// Ephemeral, in-memory grant. Nothing here is restored on launch: the creator
@@ -358,19 +353,6 @@ impl Request {
     fn is_write(&self) -> bool {
         !matches!(self, Self::Discover {} | Self::Read { .. })
     }
-
-    fn name(&self) -> &'static str {
-        match self {
-            Self::Discover {} => "discover",
-            Self::Read { .. } => "read",
-            Self::Select { .. } => "select",
-            Self::Compare { .. } => "compare",
-            Self::EditBrief { .. } => "edit_brief",
-            Self::Keep { .. } => "keep",
-            Self::Remove { .. } => "remove",
-            Self::ReopenHandoff { .. } => "reopen_handoff",
-        }
-    }
 }
 
 pub(crate) const OPERATIONS: [&str; 8] = [
@@ -500,12 +482,6 @@ pub(crate) fn decode_command(text: &str) -> Result<Command, String> {
         return Err(bounded("Command is too large."));
     }
     serde_json::from_str(text).map_err(|err| bounded(&format!("Invalid command: {err}")))
-}
-
-#[cfg(test)]
-pub(crate) fn encode_reply(reply: &Reply) -> String {
-    serde_json::to_string(reply)
-        .unwrap_or_else(|_| r#"{"kind":"invalid","reason":"Reply could not be encoded"}"#.into())
 }
 
 /// Convenience for the transport: one typed `Value` in, one typed `Value` out.

@@ -64,12 +64,18 @@ pub(crate) fn preferences(app_id: &str) -> Prefs {
 }
 
 fn verification_profile(directory: &Path) -> io::Result<PathBuf> {
-    let mut builder = DirBuilder::new();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
-    }
+    let builder = {
+        let builder = DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            let mut builder = builder;
+            builder.mode(0o700);
+            builder
+        }
+        #[cfg(not(unix))]
+        builder
+    };
     match builder.create(directory) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
