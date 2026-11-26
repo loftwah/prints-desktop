@@ -17,7 +17,7 @@
   cargo run --locked
   ```
 
-- **Agent.** Connect your approved client to your Oyster host’s `/mcp` endpoint. Use a revocable App key with `apps.read` for the Prints installation and a selected Computer and library folder. Ask the agent to list up to five outputs and report their formats and any available dimensions without downloading them. [Fungi’s read-only example](https://docs.fungi.computer/guides/call-an-app-from-your-own-server) · [Prints connection notes](docs/oyster.md)
+- **Agent.** Open **Agent access** to share the current brief, selection and references with your chosen local agent. Enable read or edit access, then copy the grant path. [Local workspace quickstart](docs/agent-workspace.md) · [Oyster connection notes](docs/oyster.md)
 
 ![The native Prints Desktop workspace. The Loftwah Creative Archive shows the Higher Than Before album cover, its contact sheet and original-export control.](docs/screenshots/creative-archive-v0.4.0.webp)
 

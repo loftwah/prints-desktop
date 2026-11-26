@@ -1,15 +1,22 @@
 //! References to originals selected by the user. Image bytes stay in their
 //! original files. Each preference record keeps its path and favourite together.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+
+use crate::workspace::AssetId;
 
 pub const MAX_REFS: usize = 300;
 pub const LIBRARY_KEY: &str = "linked-originals";
 
 #[derive(Deserialize, Serialize)]
 pub struct Reference {
+    /// Stable, path-free identity. Old snapshots have no id and are migrated
+    /// once, then kept across reorder, reopen and relocation.
+    #[serde(default)]
+    pub id: AssetId,
     #[serde(with = "native_path")]
     pub path: PathBuf,
     pub favourite: bool,
@@ -32,6 +39,25 @@ pub fn read(saved: Option<Vec<Reference>>) -> Vec<Reference> {
         }
     }
     originals
+}
+
+/// Give legacy references an opaque id before they are saved again. Ids are
+/// path-free, unique inside this library, and never derived from a filename.
+pub fn migrate_ids(records: &mut [Reference]) -> bool {
+    let mut used: HashSet<String> = records
+        .iter()
+        .filter(|record| !record.id.is_empty())
+        .map(|record| record.id.as_str().to_owned())
+        .collect();
+    let mut changed = false;
+    for (index, record) in records.iter_mut().enumerate() {
+        if record.id.is_empty() {
+            record.id = AssetId::migrated(&used, used.len() + index);
+            used.insert(record.id.as_str().to_owned());
+            changed = true;
+        }
+    }
+    changed
 }
 
 // Keep the existing UTF-8 representation and preserve other legal paths
@@ -82,8 +108,10 @@ mod tests {
         assert_eq!(old.path, Path::new("/first.jpg"));
         assert!(old.favourite);
         assert!(!old.in_draft);
+        assert!(old.id.is_empty());
 
         let reference = Reference {
+            id: AssetId::bundled("archive", "one.jpg"),
             path: OsString::from_vec(b"/x\xff.jpg".to_vec()).into(),
             favourite: true,
             in_draft: true,
@@ -91,7 +119,38 @@ mod tests {
         let encoded = serde_json::to_string(&reference).unwrap();
         let decoded: Reference = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded.path, reference.path);
+        assert_eq!(decoded.id, reference.id);
         assert!(decoded.favourite);
         assert!(decoded.in_draft);
+    }
+
+    #[test]
+    fn legacy_ids_are_migrated_once_and_survive_reorder_and_relocation() {
+        let mut records = vec![
+            Reference {
+                id: AssetId::default(),
+                path: PathBuf::from("/first.jpg"),
+                favourite: false,
+                in_draft: true,
+            },
+            Reference {
+                id: AssetId::default(),
+                path: PathBuf::from("/second.jpg"),
+                favourite: true,
+                in_draft: false,
+            },
+        ];
+        assert!(migrate_ids(&mut records));
+        let first = records[0].id.clone();
+        let second = records[1].id.clone();
+        assert_ne!(first, second);
+        assert!(!first.as_str().contains("first.jpg"));
+        assert!(!second.as_str().contains("second.jpg"));
+        assert!(!migrate_ids(&mut records));
+
+        records.swap(0, 1);
+        records[1].path = PathBuf::from("/relocated.jpg");
+        assert_eq!(records[1].id, first);
+        assert_eq!(records[0].id, second);
     }
 }

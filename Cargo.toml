@@ -13,13 +13,14 @@ name = "oyster-reader"
 required-features = ["oyster-reader"]
 
 [dependencies]
+getrandom = "0.4"
 base64 = { version = "0.22", optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"], optional = true }
 rpassword = { version = "7", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 url = { version = "2", optional = true }
-rune = { git = "https://github.com/anomalyco/rune", rev = "e725e066548688ad1bb1f38ce64ae73f06ec0968", features = ["native-file-dialog"] }
+rune = { git = "https://github.com/anomalyco/rune", rev = "e725e066548688ad1bb1f38ce64ae73f06ec0968", features = ["native-file-dialog", "tooling"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3.6.3", default-features = false, features = ["apple-native"] }

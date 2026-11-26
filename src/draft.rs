@@ -1,14 +1,59 @@
+use std::path::Path;
+
 use rune::{El, ScrollSpec, Tx, col, row};
 
-use crate::{Ink, Print, Shelf, Studio, action, label};
+use crate::{
+    Ink, Print, Shelf, Studio, action, label,
+    workspace::{AssetId, WorkspaceId},
+};
 
 const BUNDLED_KEY: &str = "draft-bundled-shortlist";
-const SHORTLIST_LIMIT: usize = 12;
+pub(crate) const SHORTLIST_LIMIT: usize = 12;
 
-#[derive(serde::Deserialize, serde::Serialize)]
-pub(crate) enum DraftAsset {
+/// A shortlist entry keeps an opaque asset id alongside its legacy locator.
+/// The locator is only used for snapshots saved before ids existed.
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+pub(crate) struct DraftAsset {
+    #[serde(default)]
+    pub id: AssetId,
+    #[serde(flatten)]
+    kind: DraftKind,
+}
+
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+enum DraftKind {
     Bundled(String),
     Linked(#[serde(with = "crate::local::native_path")] std::path::PathBuf),
+}
+
+impl DraftAsset {
+    fn bundled(name: String, id: AssetId) -> Self {
+        Self {
+            id,
+            kind: DraftKind::Bundled(name),
+        }
+    }
+
+    fn linked(path: std::path::PathBuf, id: AssetId) -> Self {
+        Self {
+            id,
+            kind: DraftKind::Linked(path),
+        }
+    }
+
+    fn name(&self) -> Option<&str> {
+        match &self.kind {
+            DraftKind::Bundled(name) => Some(name),
+            DraftKind::Linked(_) => None,
+        }
+    }
+
+    fn path(&self) -> Option<&Path> {
+        match &self.kind {
+            DraftKind::Bundled(_) => None,
+            DraftKind::Linked(path) => Some(path),
+        }
+    }
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -17,6 +62,9 @@ pub(crate) struct Workspace {
     cleared_text: Option<String>,
     pub library: Vec<crate::local::Reference>,
     pub shortlist: Vec<DraftAsset>,
+    /// persists in the local snapshot and scopes every agent write
+    #[serde(default)]
+    pub workspace_id: WorkspaceId,
 }
 
 #[derive(Default)]
@@ -31,18 +79,29 @@ enum SaveState {
 pub(crate) struct Store {
     file: rune::prefs::Prefs,
     pub loaded: Option<Workspace>,
+    pub workspace_id: WorkspaceId,
     cleared_text: Option<String>,
     state: SaveState,
 }
 
 impl Store {
     pub(crate) fn open(prefs: &rune::prefs::Prefs) -> Self {
-        let file = prefs
+        let mut file = prefs
             .path()
             .map_or_else(rune::prefs::Prefs::memory, |path| {
                 rune::prefs::Prefs::at(path.with_extension("draft-workspace.json"))
             });
-        let loaded = file.get::<Workspace>("workspace");
+        let mut loaded = file.get::<Workspace>("workspace");
+        let mut workspace_id = loaded
+            .as_ref()
+            .map_or_else(WorkspaceId::default, |saved| saved.workspace_id.clone());
+        if workspace_id.is_empty() {
+            workspace_id = WorkspaceId::current();
+            if let Some(saved) = &mut loaded {
+                saved.workspace_id = workspace_id.clone();
+                let _ = file.set("workspace", &*saved);
+            }
+        }
         let cleared_text = loaded.as_ref().and_then(|saved| saved.cleared_text.clone());
         let state = if loaded.is_some() || prefs.contains("draft") {
             SaveState::Saved
@@ -52,6 +111,7 @@ impl Store {
         Self {
             file,
             loaded,
+            workspace_id,
             cleared_text,
             state,
         }
@@ -92,24 +152,61 @@ impl Store {
     }
 }
 
-pub(crate) fn restore_bundled(studio: &mut Studio) {
+/// Returns true when a legacy shortlist needed ids, so the caller can save the
+/// migrated snapshot once the local library has been opened.
+pub(crate) fn restore_bundled(studio: &mut Studio) -> bool {
     let legacy: Vec<String> = studio.prefs.get(BUNDLED_KEY).unwrap_or_default();
-    if let Some(saved) = &studio.working.loaded {
-        studio.draft_shortlist = resolve(&studio.assets, &saved.shortlist);
+    let mut entries: Vec<DraftAsset> = if let Some(saved) = &studio.working.loaded {
+        saved.shortlist.clone()
     } else {
-        let entries: Vec<_> = legacy.into_iter().map(DraftAsset::Bundled).collect();
-        studio.draft_shortlist = resolve(&studio.assets, &entries);
+        legacy
+            .into_iter()
+            .map(|name| {
+                let id = studio
+                    .assets
+                    .iter()
+                    .find(|print| print.path().is_none() && print.filename == name)
+                    .map_or_else(
+                        || AssetId::bundled("legacy", &name),
+                        |print| print.id().clone(),
+                    );
+                DraftAsset::bundled(name, id)
+            })
+            .collect()
+    };
+    let mut migrated = false;
+    for entry in &mut entries {
+        if entry.id.is_empty()
+            && let Some(index) = resolve_one(&studio.assets, entry)
+        {
+            entry.id = studio.assets[index].id().clone();
+            migrated = true;
+        }
     }
+    studio.draft_shortlist = resolve(&studio.assets, &entries);
+    migrated
+}
+
+fn resolve_one(assets: &[Print], entry: &DraftAsset) -> Option<usize> {
+    if !entry.id.is_empty() {
+        return assets.iter().position(|print| print.id() == &entry.id);
+    }
+    assets.iter().position(|print| match entry {
+        DraftAsset {
+            kind: DraftKind::Bundled(name),
+            ..
+        } => print.path().is_none() && print.filename == *name,
+        DraftAsset {
+            kind: DraftKind::Linked(path),
+            ..
+        } => print.path() == Some(path.as_path()),
+    })
 }
 
 pub(crate) fn resolve(assets: &[Print], entries: &[DraftAsset]) -> Vec<usize> {
     let mut result = Vec::new();
     for entry in entries {
-        let index = assets.iter().position(|print| match entry {
-            DraftAsset::Bundled(name) => print.path().is_none() && print.filename == *name,
-            DraftAsset::Linked(path) => print.path() == Some(path.as_path()),
-        });
-        if let Some(index) = index.filter(|index| !result.contains(index)) {
+        if let Some(index) = resolve_one(assets, entry).filter(|index| !result.contains(index)) {
             result.push(index);
             if result.len() == SHORTLIST_LIMIT {
                 break;
@@ -127,6 +224,7 @@ pub(crate) fn persist(studio: &mut Studio) -> bool {
         .enumerate()
         .filter_map(|(index, image)| {
             Some(crate::local::Reference {
+                id: image.id().clone(),
                 path: image.path()?.to_path_buf(),
                 favourite: studio.favourites.contains(&index),
                 in_draft: false,
@@ -139,8 +237,8 @@ pub(crate) fn persist(studio: &mut Studio) -> bool {
         .filter_map(|&index| {
             let print = studio.assets.get(index)?;
             Some(print.path().map_or_else(
-                || DraftAsset::Bundled(print.filename.clone()),
-                |path| DraftAsset::Linked(path.to_path_buf()),
+                || DraftAsset::bundled(print.filename.clone(), print.id().clone()),
+                |path| DraftAsset::linked(path.to_path_buf(), print.id().clone()),
             ))
         })
         .collect();
@@ -149,12 +247,14 @@ pub(crate) fn persist(studio: &mut Studio) -> bool {
         cleared_text: studio.working.cleared_text.clone(),
         library,
         shortlist,
+        workspace_id: studio.working.workspace_id.clone(),
     })
 }
 
 pub(crate) fn clear(studio: &mut Studio, tx: &mut Tx) {
     if !studio.draft.text.is_empty() {
         studio.working.cleared_text = Some(std::mem::take(&mut studio.draft.text));
+        studio.touch();
         studio.draft = rune::TextEdit::new("");
         studio.working.pending(tx);
     }
@@ -170,6 +270,7 @@ pub(crate) fn restore_control(studio: &Studio, ink: Ink) -> Option<El> {
             |studio, tx| {
                 if let Some(text) = studio.working.cleared_text.take() {
                     studio.draft = rune::TextEdit::new(text);
+                    studio.touch();
                     studio.working.pending(tx);
                 }
             },
@@ -182,6 +283,7 @@ pub(crate) fn toggle(studio: &mut Studio, index: usize) {
     if studio.assets.get(index).is_none() {
         return;
     }
+    studio.touch();
     let kept = if let Some(position) = studio
         .draft_shortlist
         .iter()

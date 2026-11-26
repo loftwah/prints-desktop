@@ -25,6 +25,7 @@ pub(crate) fn items() -> Vec<MenuItem<Studio>> {
         MenuItem::new("Favourites", |s, tx| open_shelf(s, tx, Shelf::Favourites)).menu("Library"),
         MenuItem::new("Local Imports", |s, tx| open_shelf(s, tx, Shelf::Imports)).menu("Library"),
         MenuItem::separator().menu("Library"),
+        MenuItem::new("Agent access…", |s: &mut Studio, _| s.open_agent()).menu("Library"),
         MenuItem::new("Connect Prints", |s: &mut Studio, tx| {
             s.status.clear();
             s.screen = Screen::Connection;
