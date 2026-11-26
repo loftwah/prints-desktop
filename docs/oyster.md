@@ -28,8 +28,32 @@ The existing Loftwah host accepted a temporary Prints-only key. The desktop
 opened six indexed outputs, exported an original whose bytes matched an
 independent read of the same asset, and confirmed denial after revocation.
 The installed Prints contract accepts root reads and lacks folder discovery.
-Its model catalogue returned HTTP 502. The desktop can open that root library
-and offers web Prints for folder navigation.
+Its model catalogue returned HTTP 502. The desktop opens the readable library
+first and treats model discovery as optional; it offers web Prints for folder
+navigation.
+
+## Optional model discovery and local report
+
+`listOutputs` opens the library on its own. `listModels` then runs on a
+separate request lane with its own pending, error and retry state. While it is
+pending, outputs can be selected, paged, previewed, compared offline and
+exported. A temporary, malformed or permission-limited catalogue reply keeps
+the library usable and offers **Retry model discovery** without changing the
+page or selected output. Disconnect, confirmed revocation and a changed
+installation invalidate both lanes and the export-dialog guard; a late reply
+from an earlier connection is ignored, without claiming its transport was
+cancelled.
+
+Each failure keeps a small, reviewable **Connection report** beside the
+catalogue. **Copy connection report** writes the same text shown on screen to
+the clipboard for the existing bug form. It carries the app version and the
+build's `PRINTS_SOURCE_REVISION` when supplied, OS and architecture, the typed
+operation and method, a bounded HTTP status or failure category, an allowlisted
+refusal code, elapsed milliseconds, any observed compatibility fallback, and a
+bounded causal trail with opaque local correlation IDs. Keys, headers, bodies,
+host names, paths, Computer and installation IDs, artwork and prompts are
+never read into it. Copying is local: nothing is sent upstream or filed
+automatically.
 
 - [Issue, specification and live evidence](https://github.com/loftwah/app-composer/issues/1292)
 - [Fungi guide to calling an App with a scoped key](https://docs.fungi.computer/guides/call-an-app-from-your-own-server/)

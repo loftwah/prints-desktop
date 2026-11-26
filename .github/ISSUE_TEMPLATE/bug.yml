@@ -22,3 +22,10 @@ body:
       description: Include a public-safe screenshot or the exact error if it helps. Keep keys, private artwork, and local file paths out of the report.
     validations:
       required: true
+  - type: textarea
+    id: connection_report
+    attributes:
+      label: Connection report (optional)
+      description: Paste the report copied with **Copy connection report** from the Connect Prints or library screen. Review it first: it holds typed operation, platform, duration and opaque trail IDs, never keys, headers, bodies, paths, host, Computer, installation, artwork or prompts.
+    validations:
+      required: false

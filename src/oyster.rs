@@ -109,6 +109,162 @@ impl Error {
     }
 }
 
+/// Closed failure categories used by the local connection report. Server text
+/// is never copied into one of these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Category {
+    Success,
+    Transport,
+    Status,
+    Refused,
+    TooLarge,
+    InvalidArgument,
+    Decode,
+    Local,
+}
+
+impl Category {
+    /// Stable, lowercase wording suitable for the bug form.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Success => "completed",
+            Self::Transport => "transport failure",
+            Self::Status => "http status",
+            Self::Refused => "method refused",
+            Self::TooLarge => "size limit",
+            Self::InvalidArgument => "invalid local argument",
+            Self::Decode => "malformed reply",
+            Self::Local => "local operation failure",
+        }
+    }
+}
+
+/// A compatibility behaviour the client actually observed. The text is fixed
+/// in this crate; no host-supplied message can enter the report through it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fallback {
+    RecursiveReadUnavailable,
+    RootOnlyDeclared,
+}
+
+impl Fallback {
+    pub fn note(self) -> &'static str {
+        match self {
+            Self::RecursiveReadUnavailable => "root read attempted after recursive read failed",
+            Self::RootOnlyDeclared => "root-only library contract confirmed",
+        }
+    }
+}
+
+/// Secret-free, bounded evidence for one typed call. Both successful and
+/// failed calls produce one, so a partial capability failure stays inspectable
+/// after the required library read succeeds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Diagnostic {
+    pub operation: &'static str,
+    pub method: &'static str,
+    pub category: Category,
+    pub status: Option<u16>,
+    pub code: Option<String>,
+    pub elapsed_ms: u64,
+    pub fallback: Option<Fallback>,
+}
+
+impl Diagnostic {
+    pub fn success(
+        operation: &'static str,
+        method: &'static str,
+        elapsed_ms: u64,
+        fallback: Option<Fallback>,
+    ) -> Self {
+        Self {
+            operation,
+            method,
+            category: Category::Success,
+            status: None,
+            code: None,
+            elapsed_ms,
+            fallback,
+        }
+    }
+}
+
+impl Error {
+    pub fn category(&self) -> Category {
+        match self {
+            Self::Transport => Category::Transport,
+            Self::Status { .. } => Category::Status,
+            Self::Refused { .. } => Category::Refused,
+            Self::TooLarge => Category::TooLarge,
+            Self::InvalidArgument
+            | Self::InvalidBaseUrl
+            | Self::CredentialsInUrl
+            | Self::InsecureBaseUrl
+            | Self::InvalidInstallationId
+            | Self::InvalidKey
+            | Self::InvalidFolder
+            | Self::InvalidPrintId => Category::InvalidArgument,
+            Self::Decode => Category::Decode,
+        }
+    }
+
+    /// Build report evidence. Even a caller-supplied code is passed through
+    /// the refusal allowlist, so an echoed secret can never reach a report.
+    pub fn diagnostic(
+        &self,
+        operation: &'static str,
+        method: &'static str,
+        elapsed_ms: u64,
+        fallback: Option<Fallback>,
+    ) -> Diagnostic {
+        let (status, code) = match self {
+            Self::Status { status, code } => {
+                (Some(*status), code.as_deref().and_then(allowlisted_code))
+            }
+            Self::Refused { code, .. } => (None, allowlisted_code(code)),
+            _ => (None, None),
+        };
+        Diagnostic {
+            operation,
+            method,
+            category: self.category(),
+            status,
+            code: code.map(str::to_owned),
+            elapsed_ms,
+            fallback,
+        }
+    }
+}
+
+/// A failed library read plus the fallback it had attempted. The original
+/// `list_outputs` API stays unchanged for the diagnostic example and tests.
+#[derive(Debug)]
+pub struct ReadFailure {
+    pub error: Error,
+    pub fallback: Option<Fallback>,
+}
+
+impl From<ReadFailure> for Error {
+    fn from(failure: ReadFailure) -> Self {
+        failure.error
+    }
+}
+
+impl fmt::Display for ReadFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+impl std::error::Error for ReadFailure {}
+
+/// A library page and any compatibility fallback observed while reading it.
+#[derive(Debug)]
+pub struct OutputRead {
+    pub page: OutputPage,
+    pub fallback: Option<Fallback>,
+}
+
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -216,12 +372,32 @@ impl OysterClient {
         after: Option<Cursor>,
         limit: u8,
     ) -> Result<OutputPage, Error> {
+        self.list_outputs_detailed(folder, recursive, after, limit)
+            .map(|read| read.page)
+            .map_err(Error::from)
+    }
+
+    /// The same read with the observed compatibility fallback retained for
+    /// the local report. A failed retry still reports the attempted fallback.
+    pub fn list_outputs_detailed(
+        &self,
+        folder: Option<&str>,
+        recursive: bool,
+        after: Option<Cursor>,
+        limit: u8,
+    ) -> Result<OutputRead, ReadFailure> {
         if !(1..=24).contains(&limit) {
-            return Err(Error::InvalidArgument);
+            return Err(ReadFailure {
+                error: Error::InvalidArgument,
+                fallback: None,
+            });
         }
         if let Some(folder) = folder {
             if self.root_only() || !valid_folder(folder) {
-                return Err(Error::InvalidFolder);
+                return Err(ReadFailure {
+                    error: Error::InvalidFolder,
+                    fallback: None,
+                });
             }
         }
         let root_only = self.root_only();
@@ -238,6 +414,7 @@ impl OysterClient {
                 "printId": cursor.print_id,
             });
         }
+        let mut fallback = None;
         let result = self.call("listOutputs", input.clone());
         if let Err(error) = &result
             && !root_only
@@ -253,24 +430,39 @@ impl OysterClient {
             // Display the root page even if the recursive read is temporarily
             // unavailable. Only a host that explicitly rejects the folder
             // method confirms the older contract.
+            fallback = Some(Fallback::RecursiveReadUnavailable);
             if let Some(object) = input.as_object_mut() {
                 object.remove("recursive");
             }
-            let page = serde_json::from_value(self.call("listOutputs", input)?)
-                .map_err(|_| Error::Decode)?;
+            let page = serde_json::from_value(
+                self.call("listOutputs", input)
+                    .map_err(|error| ReadFailure { error, fallback })?,
+            )
+            .map_err(|_| ReadFailure {
+                error: Error::Decode,
+                fallback,
+            })?;
             match self.call("listFolders", json!({ "limit": 1 })) {
                 Err(Error::Status {
                     status: 403,
                     code: Some(code),
                 }) if code == "not_declared" => {
                     self.root_only.store(true, Ordering::Relaxed);
+                    fallback = Some(Fallback::RootOnlyDeclared);
                 }
-                Err(error) if error.authority_lost() => return Err(error),
+                Err(error) if error.authority_lost() => {
+                    return Err(ReadFailure { error, fallback });
+                }
                 _ => {}
             }
-            return Ok(page);
+            return Ok(OutputRead { page, fallback });
         }
-        serde_json::from_value(result?).map_err(|_| Error::Decode)
+        let page = serde_json::from_value(result.map_err(|error| ReadFailure { error, fallback })?)
+            .map_err(|_| ReadFailure {
+                error: Error::Decode,
+                fallback,
+            })?;
+        Ok(OutputRead { page, fallback })
     }
 
     /// One base64 chunk of an indexed output — requires approved
@@ -459,30 +651,38 @@ fn valid_print_id(id: &str) -> bool {
     (1..=256).contains(&count) && !id.contains('\0') && !id.contains('/')
 }
 
+/// The host's closed refusal-code grammar. Nothing outside this list is ever
+/// retained as a code, including an echoed key or other injected string.
+const REFUSAL_CODES: &[&str] = &[
+    "not_granted",
+    "revoked",
+    "grantor_lost_authority",
+    "unavailable",
+    "invalid",
+    "too_large",
+    "conflict",
+    "invalid_path",
+    "not_found",
+    "library_unavailable",
+    "attachment_budget_exceeded",
+    "not_approved",
+    "level_too_low",
+    "requires_not_granted",
+    "not_declared",
+    "invalid_input",
+    "stale_authority",
+    "approval_required",
+];
+
+fn allowlisted_code(code: &str) -> Option<&'static str> {
+    REFUSAL_CODES.iter().copied().find(|known| *known == code)
+}
+
 fn refusal_code(value: &Value) -> Option<&str> {
     let error = value.as_object()?.get("error")?;
-    Some(match error.as_str() {
-        Some(
-            code @ ("not_granted"
-            | "revoked"
-            | "grantor_lost_authority"
-            | "unavailable"
-            | "invalid"
-            | "too_large"
-            | "conflict"
-            | "invalid_path"
-            | "not_found"
-            | "library_unavailable"
-            | "attachment_budget_exceeded"
-            | "not_approved"
-            | "level_too_low"
-            | "requires_not_granted"
-            | "not_declared"
-            | "invalid_input"
-            | "stale_authority"
-            | "approval_required"),
-        ) => code,
-        _ => "unknown_refusal",
+    Some(match error.as_str().and_then(allowlisted_code) {
+        Some(code) => code,
+        None => "unknown_refusal",
     })
 }
 
@@ -757,5 +957,57 @@ mod tests {
         let text = format!("{key:?} {key}");
         assert!(!text.contains("oyk_super_secret"));
         assert!(text.contains("REDACTED"));
+    }
+
+    #[test]
+    fn diagnostic_keeps_only_bounded_allowlisted_fields() {
+        let error = Error::Status {
+            status: 502,
+            code: Some("oyk_injected_secret".into()),
+        };
+        let diagnostic = error.diagnostic("discover models", "listModels", 42, None);
+        assert_eq!(diagnostic.category, Category::Status);
+        assert_eq!(diagnostic.status, Some(502));
+        assert_eq!(diagnostic.code, None);
+        assert_eq!(diagnostic.elapsed_ms, 42);
+        let text = format!("{diagnostic:?}");
+        assert!(!text.contains("oyk_injected_secret"));
+
+        let refused = Error::Refused {
+            method: "listModels",
+            code: "oyk_fixture_key".into(),
+        };
+        assert_eq!(
+            refused
+                .diagnostic("discover models", "listModels", 1, None)
+                .code,
+            None
+        );
+        let allowed = Error::Refused {
+            method: "listModels",
+            code: "not_granted".into(),
+        };
+        assert_eq!(
+            allowed
+                .diagnostic("discover models", "listModels", 1, None)
+                .code
+                .as_deref(),
+            Some("not_granted")
+        );
+    }
+
+    #[test]
+    fn success_diagnostic_records_observed_fallback() {
+        let diagnostic = Diagnostic::success(
+            "connect",
+            "listOutputs",
+            17,
+            Some(Fallback::RecursiveReadUnavailable),
+        );
+        assert_eq!(diagnostic.category, Category::Success);
+        assert_eq!(
+            diagnostic.fallback.map(Fallback::note),
+            Some("root read attempted after recursive read failed")
+        );
     }
 }
