@@ -2199,7 +2199,7 @@ fn agent_panel(s: &Studio, p: Ink) -> El {
         Some(AccessMode::Read) => ("Read only", p.accent),
         Some(AccessMode::Edit) => ("Can edit", p.accent),
     };
-    let mut controls = col().w_full().gap(8.0);
+    let mut controls = col().w_full().max_w(360.0).gap(8.0);
     match access.mode() {
         None => {
             controls = controls
@@ -2295,11 +2295,12 @@ fn agent_panel(s: &Studio, p: Ink) -> El {
         .child(label("Agent access", 36.0, 650.0, p.primary))
         .child(
             label(
-                "Share this brief, the archive and your selected or shortlisted local references with a local agent.",
+                "Share the brief, the archive and your selected or shortlisted local references with a local agent.",
                 14.0,
                 450.0,
                 p.muted,
             )
+            .max_w(560.0)
             .wrap(),
         )
         .child(
