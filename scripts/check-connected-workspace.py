@@ -20,6 +20,9 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 BINARY = ROOT / Path(os.environ.get("CARGO_TARGET_DIR", "target")) / "debug" / ("prints-desktop.exe" if sys.platform == "win32" else "prints-desktop")
 ASSET = (ROOT / "assets/horizon.jpg").read_bytes()
+# A second, distinct output proves an export stays bound to the item chosen
+# when the transfer started even if the visible selection moves on.
+ALT_ASSET = ASSET + b"\nsecond fictional output"
 KEY = "oyk_fictional_local_app_key"
 CALLS = []
 EVENTS = []
@@ -35,19 +38,21 @@ SENSITIVE = [
 ]
 
 
-def output(computer=None, prompt=None, path=None):
+def output(index=0, computer=None, prompt=None, path=None):
+    asset = ALT_ASSET if index else ASSET
+    default_path = "/library/Studies/second.jpg" if index else "/library/Studies/horizon.jpg"
     return {
-        "path": path or ("/private/owners/secret.jpg" if OysterFixture.inject else "/library/Studies/horizon.jpg"),
+        "path": path or ("/private/owners/secret.jpg" if OysterFixture.inject else default_path),
         "print": {
-            "printId": "print_fixture",
+            "printId": ("print_fixture_2" if index else "print_fixture"),
             "computerId": computer or ("computer-private-42" if OysterFixture.inject else "fictional-computer"),
             "kind": "image",
             "model": "fictional-image-model",
             "format": "jpg",
-            "bytes": len(ASSET),
+            "bytes": 0 if OysterFixture.unknown_total else len(asset),
             "width": 1280,
             "height": 720,
-            "createdAt": 1730000000000,
+            "createdAt": 1730000000000 + index,
         },
         "characters": ["Garden keeper"],
         "style": "Field notes",
@@ -76,6 +81,16 @@ class OysterFixture(BaseHTTPRequestHandler):
     catalogue_hold = False
     catalogue_release = None
     late_second = None
+    # Original-transfer controls. Holding a chunk leaves a request in flight
+    # while the native replay can ask the worker to stop before the next one.
+    chunk_delay = 0.0
+    chunk_hold_from = None
+    chunk_release = None
+    chunk_fail_at = None
+    chunk_failed = False
+    chunk_revoke_at = None
+    chunk_count = 0
+    unknown_total = False
 
     def log_message(self, *_):
         pass
@@ -132,25 +147,52 @@ class OysterFixture(BaseHTTPRequestHandler):
             elif self.folder_error and arguments.get("folder") == "Studies":
                 self.reply(502, {"error": "App execution failed"})
             else:
-                self.reply(200, {"items": [output()], "next": None})
+                self.reply(200, {"items": [output(0), output(1)], "next": None})
         elif operation == "listFolders":
             if self.legacy:
                 self.reply(403, {"error": "not_declared"})
             else:
                 self.reply(200, {"folders": [{"name": "Studies", "folder": "Studies"}], "next": None})
         elif operation == "getOutput":
-            self.reply(200, output())
+            index = 1 if "second.jpg" in arguments["path"] else 0
+            self.reply(200, output(index))
         elif operation == "openOutput":
+            index = 1 if arguments["printId"] == "print_fixture_2" else 0
+            asset = ALT_ASSET if index else ASSET
             offset = arguments["byteOffset"]
-            chunk = ASSET[offset : offset + arguments["byteLength"]]
+            type(self).chunk_count += 1
+            if (
+                type(self).chunk_hold_from is not None
+                and type(self).chunk_count >= type(self).chunk_hold_from
+                and type(self).chunk_release is not None
+            ):
+                type(self).chunk_release.wait(timeout=0.8)
+            if (
+                type(self).chunk_fail_at is not None
+                and offset == type(self).chunk_fail_at
+                and not type(self).chunk_failed
+            ):
+                type(self).chunk_failed = True
+                self.reply(502, {"error": "App execution failed", "message": " | ".join(SENSITIVE)})
+                origin = type(self).run_started or STARTED
+                EVENTS.append(("chunk_failed", round(time.monotonic() - origin, 3), str(offset)))
+                return
+            if type(self).chunk_revoke_at is not None and offset == type(self).chunk_revoke_at:
+                self.reply(200, {"error": "revoked", "message": " | ".join(SENSITIVE)})
+                return
+            if type(self).chunk_delay:
+                time.sleep(type(self).chunk_delay)
+            chunk = asset[offset : offset + arguments["byteLength"]]
             self.reply(200, {
-                "path": output()["path"],
-                "printId": "print_fixture",
+                "path": output(index)["path"],
+                "printId": arguments["printId"],
                 "byteOffset": offset,
                 "content": base64.b64encode(chunk).decode(),
                 "encoding": "base64",
                 "truncated": bool(chunk),
             })
+            origin = type(self).run_started or STARTED
+            EVENTS.append(("chunk_replied", round(time.monotonic() - origin, 3), str(offset)))
         else:
             self.reply(404, {"error": "not_found"})
 
@@ -250,6 +292,12 @@ def main():
     modes.add_argument("--catalogue-fail", choices=["temporary", "malformed", "permission", "revoked"])
     modes.add_argument("--catalogue-retry", action="store_true")
     modes.add_argument("--late-catalogue", action="store_true")
+    modes.add_argument("--transfer-progress", action="store_true")
+    modes.add_argument("--transfer-unknown-total", action="store_true")
+    modes.add_argument("--transfer-browse", action="store_true")
+    modes.add_argument("--transfer-cancel", action="store_true")
+    modes.add_argument("--transfer-retry", action="store_true")
+    modes.add_argument("--transfer-revoked", action="store_true")
     options = parser.parse_args()
     OysterFixture.revoke = options.revoked
     OysterFixture.legacy = options.legacy
@@ -267,6 +315,19 @@ def main():
     OysterFixture.catalogue_hold = options.catalogue_pending_live or options.catalogue_pending_export
     OysterFixture.catalogue_release = threading.Event()
     OysterFixture.late_second = threading.Event() if options.late_catalogue else None
+    OysterFixture.chunk_delay = (
+        0.35 if options.transfer_progress or options.transfer_unknown_total
+        else 0.30 if options.transfer_browse
+        else 0.18 if options.transfer_retry
+        else 0.0
+    )
+    OysterFixture.chunk_hold_from = 2 if options.transfer_cancel else None
+    OysterFixture.chunk_release = threading.Event() if options.transfer_cancel else None
+    OysterFixture.chunk_fail_at = 131072 if options.transfer_retry else None
+    OysterFixture.chunk_failed = False
+    OysterFixture.chunk_revoke_at = 131072 if options.transfer_revoked else None
+    OysterFixture.chunk_count = 0
+    OysterFixture.unknown_total = options.transfer_unknown_total
     OysterFixture.attempts = 0
     OysterFixture.first_model_request = None
     OysterFixture.run_started = None
@@ -342,6 +403,55 @@ def main():
                     (6.20, "tap", {"key": "report-details"}),
                 ]
                 finish = "6.55"
+            elif options.transfer_progress or options.transfer_unknown_total:
+                actions += [
+                    (3.40, "tap", {"key": "browse-folders"}),
+                    (3.90, "tap", {"key": "folder-0"}),
+                    (4.40, "tap", {"key": "hosted-save"}),
+                    (4.85, "tap", {"key": "hosted-item-1"}),
+                    (5.10, "tap", {"key": "report-details"}),
+                ]
+                finish = "5.35"
+            elif options.transfer_browse:
+                actions += [
+                    (3.40, "tap", {"key": "browse-folders"}),
+                    (3.90, "tap", {"key": "folder-0"}),
+                    (4.40, "tap", {"key": "hosted-save"}),
+                    (4.85, "tap", {"key": "browse-folders"}),
+                    (5.15, "tap", {"key": "folder-0"}),
+                    (5.45, "tap", {"key": "hosted-item-1"}),
+                    (6.40, "file-dialog", {"path": str(export_path)}),
+                    (6.70, "tap", {"key": "report-details"}),
+                ]
+                finish = "7.00"
+            elif options.transfer_cancel:
+                actions += [
+                    (3.40, "tap", {"key": "browse-folders"}),
+                    (3.90, "tap", {"key": "folder-0"}),
+                    (4.40, "tap", {"key": "hosted-save"}),
+                    (4.85, "tap", {"key": "hosted-transfer-cancel"}),
+                    (5.60, "tap", {"key": "report-details"}),
+                ]
+                finish = "6.20"
+            elif options.transfer_retry:
+                actions += [
+                    (3.40, "tap", {"key": "browse-folders"}),
+                    (3.90, "tap", {"key": "folder-0"}),
+                    (4.40, "tap", {"key": "hosted-save"}),
+                    (5.10, "tap", {"key": "hosted-item-1"}),
+                    (5.45, "tap", {"key": "hosted-transfer-retry"}),
+                    (6.90, "file-dialog", {"path": str(export_path)}),
+                    (7.15, "tap", {"key": "report-details"}),
+                ]
+                finish = "7.45"
+            elif options.transfer_revoked:
+                actions += [
+                    (3.40, "tap", {"key": "browse-folders"}),
+                    (3.90, "tap", {"key": "folder-0"}),
+                    (4.40, "tap", {"key": "hosted-save"}),
+                    (5.10, "tap", {"key": "report-details"}),
+                ]
+                finish = "5.50"
             else:
                 actions += [
                     (3.40, "tap", {"key": "browse-folders"}),
@@ -380,6 +490,8 @@ def main():
                 OysterFixture.catalogue_release.set()
             if OysterFixture.late_second is not None:
                 OysterFixture.late_second.set()
+            if OysterFixture.chunk_release is not None:
+                OysterFixture.chunk_release.set()
             server.shutdown()
 
         contents = tree.read_text()
@@ -495,6 +607,83 @@ def main():
                 "Late-catalogue replay passed. The old answer was invalidated by disconnect/reconnect; "
                 f"new library at {first('library_read_completed')}s, new catalogue at "
                 f"{first('catalogue_completed')}s."
+            )
+            return
+        if options.transfer_progress or options.transfer_unknown_total:
+            report = report_text(nodes)
+            assert_report_safe(report)
+            assert has_key(nodes, "hosted-transfer-cancel"), "a stop action must be visible"
+            assert has_key(nodes, "hosted-item-1"), "browsing must stay usable during a transfer"
+            assert "Fetching original" in contents
+            assert "bytes received" in contents
+            assert "100%" not in contents, "an unfinished transfer must not claim completion"
+            assert first("chunk_replied", capture_events) is not None, "no chunk was observed"
+            if options.transfer_unknown_total:
+                assert "total unknown" in contents
+                assert f"of {len(ASSET)} bytes" not in contents
+            else:
+                assert f"of {len(ASSET)} bytes received" in contents
+            print(
+                f"Transfer-progress replay passed. First decoded chunk at "
+                f"{first('chunk_replied')}s; observed bytes shown at the {finish}s capture "
+                "while the library stayed browsable."
+            )
+            return
+        if options.transfer_browse:
+            assert (run / "export.jpg").read_bytes() == ASSET, "export must match the chosen original"
+            assert has_key(nodes, "hosted-item-1"), "selection moved during the transfer"
+            assert "Original exported" in contents
+            ids = {request["printId"] for operation, request in CALLS if operation == "openOutput"}
+            assert ids == {"print_fixture"}, f"transfer identity changed: {ids}"
+            assert not any(
+                operation == "getOutput" and request["path"].endswith("second.jpg")
+                for operation, request in CALLS
+            )
+            report = report_text(nodes)
+            assert_report_safe(report)
+            print(
+                "Transfer-browse replay passed. Browsing and selection changed mid-transfer; "
+                f"first chunk at {first('chunk_replied')}s and the exact chosen original was written."
+            )
+            return
+        if options.transfer_cancel:
+            assert not (run / "export.jpg").exists(), "a cancelled transfer must not write a file"
+            assert "Stopping the transfer" in contents or "Transfer stopped" in contents
+            report = report_text(nodes)
+            assert_report_safe(report)
+            assert "in-flight request not known to be cancelled" in report
+            assert OysterFixture.chunk_count == 2, OysterFixture.chunk_count
+            assert any(event == "chunk_replied" and offset == "131072" for event, _, offset in capture_events)
+            assert has_key(nodes, "hosted-item-1"), "the readable page survived cancellation"
+            print(
+                "Transfer-cancel replay passed. The in-flight reply returned before capture, "
+                f"and the app stopped at {OysterFixture.chunk_count} chunk requests; "
+                "no Save dialog and no file were produced."
+            )
+            return
+        if options.transfer_retry:
+            assert (run / "export.jpg").read_bytes() == ASSET
+            assert "Original exported" in contents
+            assert has_key(nodes, "hosted-item-0"), "the readable page survived the failure"
+            report = report_text(nodes)
+            assert_report_safe(report)
+            assert "http 502" in report
+            assert OysterFixture.chunk_count > 5, OysterFixture.chunk_count
+            print(
+                f"Transfer-retry replay passed. Failure at {first('chunk_failed')}s kept the page; "
+                f"retry used {OysterFixture.chunk_count} chunk requests and wrote the exact original."
+            )
+            return
+        if options.transfer_revoked:
+            assert not (run / "export.jpg").exists(), "a revoked transfer must not write a file"
+            assert has_key(nodes, "hosted-item-0") is False
+            assert "key was refused or revoked" in contents
+            report = report_text(nodes)
+            assert_report_safe(report)
+            assert OysterFixture.chunk_count <= 2, OysterFixture.chunk_count
+            print(
+                "Transfer-revocation replay passed. Authority loss cleared the library and "
+                "no stale Save continuation ran."
             )
             return
         assert (run / "export.jpg").read_bytes() == ASSET

@@ -2,11 +2,13 @@
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use prints_desktop::oyster::{
     ApiKey, Category, Cursor as PageCursor, Diagnostic, Error, Fallback, FolderPage, Model,
-    OutputItem, OutputPage, OutputRead, OysterClient, ReadFailure,
+    OutputItem, OutputPage, OutputRead, OysterClient, ReadFailure, TransferCapture,
 };
 use rune::Latest;
 
@@ -118,23 +120,12 @@ enum Transfer {
     Original,
 }
 
-impl Transfer {
-    fn limit(self) -> u64 {
-        match self {
-            Self::Preview => PREVIEW_BYTES,
-            Self::Original => EXPORT_BYTES,
-        }
-    }
-}
-
 enum Operation {
     Connect,
     Forget,
     LoadPage(PagePosition),
     BrowseFolders,
     Transfer(Transfer),
-    ChooseDestination,
-    WriteOriginal(OriginalWrite),
 }
 
 impl Operation {
@@ -146,8 +137,6 @@ impl Operation {
             Self::BrowseFolders => "Loading folders…",
             Self::Transfer(Transfer::Preview) => "Loading image preview…",
             Self::Transfer(Transfer::Original) => "Fetching original…",
-            Self::ChooseDestination => "Choose where to save the original…",
-            Self::WriteOriginal(_) => "Writing original…",
         }
     }
 
@@ -157,7 +146,7 @@ impl Operation {
             Self::Connect | Self::LoadPage(_) => "listOutputs",
             Self::BrowseFolders => "listFolders",
             Self::Transfer(_) => "openOutput",
-            Self::Forget | Self::ChooseDestination | Self::WriteOriginal(_) => "local",
+            Self::Forget => "local",
         }
     }
 
@@ -169,7 +158,6 @@ impl Operation {
             Self::BrowseFolders => "browse folders",
             Self::Transfer(Transfer::Preview) => "load preview",
             Self::Transfer(Transfer::Original) => "fetch original",
-            Self::ChooseDestination | Self::WriteOriginal(_) => "export original",
         }
     }
 }
@@ -179,7 +167,6 @@ enum Reply {
     Page(OutputRead),
     Folders(FolderPage),
     Preview(Vec<u8>),
-    Export(Vec<u8>, String),
     Forgotten,
 }
 
@@ -326,6 +313,7 @@ impl Failure {
 enum Lane {
     Library,
     Catalogue,
+    Transfer,
 }
 
 impl Lane {
@@ -333,6 +321,7 @@ impl Lane {
         match self {
             Self::Library => "library",
             Self::Catalogue => "catalogue",
+            Self::Transfer => "transfer",
         }
     }
 }
@@ -393,6 +382,116 @@ struct CatalogueEnvelope {
     result: Result<Vec<Model>, Failure>,
 }
 
+/// The identity of one original transfer. It carries the connection generation
+/// and the seal over the immutable output capture, so an answer from another
+/// selection, epoch or session can never be applied by coincidence.
+#[derive(Clone)]
+struct TransferPending {
+    correlation: String,
+    session: u64,
+    epoch: u64,
+    seal: u64,
+    started: Instant,
+}
+
+enum TransferReply {
+    Original(Vec<u8>),
+    /// A cooperative stop was observed at a chunk boundary. No file was saved.
+    Stopped,
+}
+
+struct TransferEnvelope {
+    pending: TransferPending,
+    diagnostic: Diagnostic,
+    result: Result<TransferReply, Failure>,
+}
+
+/// One observed chunk, coalesced into a single slot and delivered through the
+/// same Rune wake mechanism as the final answer. Cumulative byte counts mean
+/// nothing is lost when intermediate observations are replaced.
+struct TransferProgressEvent {
+    pending: TransferPending,
+    observed: u64,
+}
+
+/// A single coalesced progress slot. Publishing writes the newest observation
+/// and calls the waker directly: no extra background worker is started per
+/// chunk, and a superseded observation never lands after a newer one.
+#[derive(Clone)]
+struct ProgressSlot {
+    inner: Arc<ProgressSlotInner>,
+}
+
+struct ProgressSlotInner {
+    value: Mutex<Option<TransferProgressEvent>>,
+    wake: Mutex<Option<Waker>>,
+}
+
+impl ProgressSlot {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(ProgressSlotInner {
+                value: Mutex::new(None),
+                wake: Mutex::new(None),
+            }),
+        }
+    }
+
+    fn set_waker(&self, wake: Waker) {
+        *self.inner.wake.lock().unwrap() = Some(wake);
+    }
+
+    fn publish(&self, event: TransferProgressEvent) {
+        *self.inner.value.lock().unwrap() = Some(event);
+        if let Some(wake) = self.inner.wake.lock().unwrap().clone() {
+            wake();
+        }
+    }
+
+    fn take(&self) -> Option<TransferProgressEvent> {
+        self.inner.value.lock().unwrap().take()
+    }
+
+    fn clear(&self) {
+        *self.inner.value.lock().unwrap() = None;
+    }
+}
+
+/// Original transfers own their own state. They never occupy the library's
+/// `operation`, so browsing, selection and preview stay live during a fetch.
+enum TransferState {
+    Idle,
+    Fetching {
+        capture: TransferCapture,
+        pending: TransferPending,
+        observed: u64,
+        total: Option<u64>,
+        cancel: Arc<AtomicBool>,
+    },
+    /// A stop was requested. The blocking call already in flight is allowed to
+    /// finish, but its bytes are dropped and no dialog may follow.
+    Stopping {
+        pending: TransferPending,
+    },
+    Dialog {
+        capture: TransferCapture,
+        pending: TransferPending,
+        /// Exact owner of the open Save dialog. Its correlation is local to
+        /// the dialog, not to the fetch that preceded it.
+        dialog: Pending,
+        bytes: Vec<u8>,
+    },
+    /// The user accepted a destination. The local write finishes atomically
+    /// here, still on the transfer lane, without occupying library `operation`.
+    Writing {
+        pending: Pending,
+        write: OriginalWrite,
+    },
+    Failed {
+        capture: TransferCapture,
+    },
+}
+
 pub(super) struct Hosted {
     origin: TextEdit,
     installation: TextEdit,
@@ -409,6 +508,11 @@ pub(super) struct Hosted {
     next_id: u64,
     request: Latest<Envelope>,
     catalogue_request: Latest<CatalogueEnvelope>,
+    /// Third independent lane; progress is one coalesced slot, not a task per
+    /// chunk. Both reach the UI through the same waker as the other lanes.
+    transfer_request: Latest<TransferEnvelope>,
+    transfer_progress: ProgressSlot,
+    transfer: TransferState,
     primary_pending: Option<Pending>,
     catalogue_pending: Option<Pending>,
     catalogue_retry: u32,
@@ -465,6 +569,9 @@ impl Hosted {
             next_id: 0,
             request: Latest::default(),
             catalogue_request: Latest::default(),
+            transfer_request: Latest::default(),
+            transfer_progress: ProgressSlot::new(),
+            transfer: TransferState::Idle,
             primary_pending: None,
             catalogue_pending: None,
             catalogue_retry: 0,
@@ -478,7 +585,9 @@ impl Hosted {
 
     pub(super) fn set_waker(&mut self, wake: Waker) {
         self.request.set_waker(wake.clone());
-        self.catalogue_request.set_waker(wake);
+        self.catalogue_request.set_waker(wake.clone());
+        self.transfer_request.set_waker(wake.clone());
+        self.transfer_progress.set_waker(wake);
     }
 
     pub(super) fn connected(&self) -> bool {
@@ -487,6 +596,49 @@ impl Hosted {
 
     fn busy(&self) -> bool {
         self.operation.is_some()
+    }
+
+    /// One hosted transfer at a time. Fetching, stopping, an open Save dialog
+    /// and an accepted write all block a second transfer, so two dialogs can
+    /// never be queued.
+    fn transfer_busy(&self) -> bool {
+        !matches!(
+            &self.transfer,
+            TransferState::Idle | TransferState::Failed { .. }
+        )
+    }
+
+    fn transfer_pending(&self) -> Option<&TransferPending> {
+        match &self.transfer {
+            TransferState::Fetching { pending, .. }
+            | TransferState::Stopping { pending, .. }
+            | TransferState::Dialog { pending, .. } => Some(pending),
+            TransferState::Writing { .. } | TransferState::Idle | TransferState::Failed { .. } => {
+                None
+            }
+        }
+    }
+
+    fn log_transfer_event(
+        &mut self,
+        pending: &TransferPending,
+        kind: TrailKind,
+        elapsed_ms: u64,
+        accepted: bool,
+        detail: &str,
+    ) {
+        if self.trail.len() >= TRAIL_LIMIT {
+            self.trail.pop_front();
+        }
+        self.trail.push_back(TrailEvent {
+            correlation: pending.correlation.clone(),
+            lane: Lane::Transfer,
+            method: "openOutput",
+            kind,
+            elapsed_ms,
+            accepted,
+            detail: detail.chars().take(90).collect(),
+        });
     }
 
     fn next_correlation(&mut self) -> String {
@@ -702,6 +854,23 @@ impl Hosted {
     fn disconnect(&mut self) {
         self.request.cancel();
         self.catalogue_request.cancel();
+        self.transfer_request.cancel();
+        self.transfer_progress.clear();
+        if let TransferState::Fetching { cancel, .. } = &self.transfer {
+            // Stop future chunk dispatch too; the channel cancel alone only
+            // drops a late answer, it does not reach a running worker.
+            cancel.store(true, Ordering::Release);
+        }
+        if let Some(pending) = self.transfer_pending().cloned() {
+            self.log_transfer_event(
+                &pending,
+                TrailKind::Invalidated,
+                elapsed_ms(pending.started),
+                false,
+                "connection ended; a late answer is ignored, transport not known to be cancelled",
+            );
+        }
+        self.transfer = TransferState::Idle;
         if let Some(pending) = self.primary_pending.take() {
             self.log_event(
                 &pending,
@@ -732,8 +901,11 @@ impl Hosted {
     }
 
     pub(super) fn finish_write(&mut self) {
-        if matches!(self.operation, Some(Operation::WriteOriginal(_))) {
-            self.operation = None;
+        if matches!(
+            &self.transfer,
+            TransferState::Dialog { .. } | TransferState::Writing { .. }
+        ) {
+            self.transfer = TransferState::Idle;
         }
     }
 
@@ -871,6 +1043,15 @@ impl Hosted {
     }
 
     fn transfer(&mut self, transfer: Transfer) {
+        match transfer {
+            Transfer::Preview => self.load_preview(),
+            Transfer::Original => self.start_original_transfer(None),
+        }
+    }
+
+    /// A preview is short and bounded, so it keeps the library lane. It stays
+    /// available while an original transfer runs on its own lane.
+    fn load_preview(&mut self) {
         if self.busy() {
             return;
         }
@@ -880,16 +1061,15 @@ impl Hosted {
         let Some(item) = library.selected().cloned() else {
             return;
         };
-        let limit = transfer.limit();
-        if item.print.bytes > limit {
+        if item.print.bytes > PREVIEW_BYTES {
             self.status = format!(
                 "This original exceeds the {} MiB limit.",
-                limit / (1024 * 1024)
+                PREVIEW_BYTES / (1024 * 1024)
             );
             return;
         }
         let client = library.client.clone();
-        let operation = Operation::Transfer(transfer);
+        let operation = Operation::Transfer(Transfer::Preview);
         let (report_operation, method) = (operation.report_operation(), operation.method());
         let pending = self.start(operation);
         self.request.request(
@@ -901,14 +1081,16 @@ impl Hosted {
                     .map_err(|error| {
                         failure_from_error(report_operation, method, started, error, None)
                     })
-                    .and_then(|bytes| match transfer {
-                        Transfer::Preview if !previewable(&bytes) => Err(Failure::local(
-                            report_operation,
-                            method,
-                            "This image format can be exported or opened in web Prints.",
-                        )),
-                        Transfer::Preview => Ok(Reply::Preview(bytes)),
-                        Transfer::Original => Ok(Reply::Export(bytes, filename(&item.path))),
+                    .and_then(|bytes| {
+                        if previewable(&bytes) {
+                            Ok(Reply::Preview(bytes))
+                        } else {
+                            Err(Failure::local(
+                                report_operation,
+                                method,
+                                "This image format can be exported or opened in web Prints.",
+                            ))
+                        }
                     });
                 let diagnostic = match &result {
                     Ok(_) => {
@@ -923,6 +1105,133 @@ impl Hosted {
                 }
             },
         );
+    }
+
+    /// Start one original transfer bound to an immutable capture. A retry
+    /// reuses the capture from the failed attempt, never the current selection.
+    fn start_original_transfer(&mut self, reuse: Option<TransferCapture>) {
+        if self.transfer_busy() {
+            return;
+        }
+        let correlation = self.next_correlation();
+        let Some(library) = &self.library else {
+            return;
+        };
+        let client = library.client.clone();
+        let epoch = self.epoch;
+        let session = self.session;
+        // A retry rebinds the captured item to the current generation and the
+        // new correlation. The seal must match the correlation actually sent;
+        // the user's current selection is never consulted here.
+        let capture = match reuse {
+            Some(previous) => TransferCapture::new(previous.item(), epoch, &correlation),
+            None => {
+                let Some(item) = library.selected() else {
+                    return;
+                };
+                if item.print.bytes > EXPORT_BYTES {
+                    self.status = format!(
+                        "This original exceeds the {} MiB limit.",
+                        EXPORT_BYTES / (1024 * 1024)
+                    );
+                    return;
+                }
+                TransferCapture::new(item, epoch, &correlation)
+            }
+        };
+        let pending = TransferPending {
+            correlation,
+            session,
+            epoch,
+            seal: capture.seal(),
+            started: Instant::now(),
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let progress = self.transfer_progress.clone();
+        let total = capture.total();
+        self.transfer = TransferState::Fetching {
+            capture: capture.clone(),
+            pending: pending.clone(),
+            observed: 0,
+            total,
+            cancel: cancel.clone(),
+        };
+        self.status.clear();
+        self.log_transfer_event(&pending, TrailKind::Started, 0, false, "");
+        self.transfer_request.request(
+            (client, capture, pending, cancel, progress),
+            move |(client, capture, pending, cancel, progress)| {
+                let started = Instant::now();
+                let result = client.transfer_original(&capture, &cancel, |update| {
+                    if !cancel.load(Ordering::Acquire) {
+                        progress.publish(TransferProgressEvent {
+                            pending: pending.clone(),
+                            observed: update.observed,
+                        });
+                    }
+                });
+                let result = match result {
+                    Ok(bytes) => Ok(TransferReply::Original(bytes)),
+                    Err(Error::Cancelled) => Ok(TransferReply::Stopped),
+                    Err(error) => Err(failure_from_error(
+                        "fetch original",
+                        "openOutput",
+                        started,
+                        error,
+                        None,
+                    )),
+                };
+                let diagnostic = match &result {
+                    Ok(_) => Diagnostic::success(
+                        "fetch original",
+                        "openOutput",
+                        elapsed_ms(started),
+                        None,
+                    ),
+                    Err(failure) => failure.diagnostic.clone(),
+                };
+                TransferEnvelope {
+                    pending,
+                    diagnostic,
+                    result,
+                }
+            },
+        );
+    }
+
+    /// Cooperative stop. The flag is checked before each next chunk; a request
+    /// already in flight is not claimed to be aborted, and its bytes are
+    /// dropped before any dialog can be opened.
+    fn cancel_transfer(&mut self) {
+        let stop = match &self.transfer {
+            TransferState::Fetching {
+                pending, cancel, ..
+            } if !cancel.load(Ordering::Acquire) => Some((pending.clone(), cancel.clone())),
+            _ => None,
+        };
+        if let Some((pending, cancel)) = stop {
+            cancel.store(true, Ordering::Release);
+            self.log_transfer_event(
+                &pending,
+                TrailKind::Invalidated,
+                elapsed_ms(pending.started),
+                false,
+                "stop requested; in-flight request not known to be cancelled",
+            );
+            self.transfer = TransferState::Stopping { pending };
+            self.status = "Stopping the transfer. No file will be saved.".into();
+        }
+    }
+
+    fn retry_transfer(&mut self) {
+        let capture = match &self.transfer {
+            TransferState::Failed { capture, .. } => Some(capture.clone()),
+            _ => None,
+        };
+        if let Some(capture) = capture {
+            self.transfer = TransferState::Idle;
+            self.start_original_transfer(Some(capture));
+        }
     }
 
     /// Short, actionable next step drawn only from typed evidence.
@@ -1076,31 +1385,290 @@ pub(super) fn poll(s: &mut Studio, _: f64, tx: &mut Tx) -> bool {
         updated = true;
         apply_library(s, tx, envelope);
     }
-    if let Some(Operation::WriteOriginal(write)) = &s.hosted.operation {
-        if let Some(result) = write.take() {
-            s.hosted.operation = None;
-            if let Some(pending) = s.hosted.primary_pending.take() {
-                let (kind, detail) = match &result {
-                    Ok(_) => (TrailKind::Completed, "original written"),
-                    Err(_) => (TrailKind::Failed, "original write failed"),
-                };
-                let elapsed = elapsed_ms(pending.started);
-                s.hosted
-                    .log_event(&pending, Lane::Library, kind, elapsed, true, detail);
-            }
-            match result {
-                Ok(path) => {
-                    if let Some(library) = &mut s.hosted.library {
-                        library.last_export = Some(path);
-                    }
-                    s.hosted.status = "Original exported.".into();
+    // Observed chunks and the final answer arrive on the same waker but in
+    // separate slots, so a late progress event cannot swallow a completion.
+    if let Some(progress) = s.hosted.transfer_progress.take() {
+        updated = true;
+        apply_transfer_progress(s, progress);
+    }
+    if let Some(transfer) = s.hosted.transfer_request.take() {
+        updated = true;
+        apply_transfer(s, tx, transfer);
+    }
+    // An accepted local write completes atomically on the transfer lane. It
+    // never borrows the library busy flag or invalidates its primary pending.
+    let written = match &s.hosted.transfer {
+        TransferState::Writing { write, .. } => write.take(),
+        _ => None,
+    };
+    if let Some(result) = written {
+        let pending = match std::mem::replace(&mut s.hosted.transfer, TransferState::Idle) {
+            TransferState::Writing { pending, .. } => pending,
+            _ => unreachable!(),
+        };
+        let (kind, detail) = match &result {
+            Ok(_) => (TrailKind::Completed, "original written"),
+            Err(_) => (TrailKind::Failed, "original write failed"),
+        };
+        let elapsed = elapsed_ms(pending.started);
+        s.hosted
+            .log_event(&pending, Lane::Library, kind, elapsed, true, detail);
+        match result {
+            Ok(path) => {
+                if let Some(library) = &mut s.hosted.library {
+                    library.last_export = Some(path);
                 }
-                Err(_) => s.hosted.status = "Couldn't write the selected file.".into(),
+                s.hosted.status = "Original exported.".into();
             }
-            updated = true;
+            Err(_) => s.hosted.status = "Couldn't write the selected file.".into(),
         }
+        updated = true;
     }
     updated
+}
+
+/// Observed chunks only update the current fetch. A stale progress event, a
+/// cancelled transfer or a changed connection is ignored without touching the
+/// page, selection, preview or status.
+fn apply_transfer_progress(s: &mut Studio, event: TransferProgressEvent) {
+    let h = &mut s.hosted;
+    let (epoch, session) = (h.epoch, h.session);
+    if let TransferState::Fetching {
+        pending, observed, ..
+    } = &mut h.transfer
+        && pending.correlation == event.pending.correlation
+        && pending.epoch == epoch
+        && pending.epoch == event.pending.epoch
+        && pending.session == session
+        && pending.session == event.pending.session
+    {
+        *observed = event.observed;
+    }
+}
+
+/// Deliver one transfer-lane answer only when its generation, seal, session
+/// and correlation still match. Obsolete answers are logged as ignored; no
+/// Save dialog or library change may follow them.
+fn apply_transfer(s: &mut Studio, tx: &mut Tx, envelope: TransferEnvelope) {
+    let h = &mut s.hosted;
+    if let TransferState::Stopping { pending, .. } = &h.transfer
+        && pending.correlation == envelope.pending.correlation
+    {
+        h.log_transfer_event(
+            &envelope.pending,
+            TrailKind::Ignored,
+            envelope.diagnostic.elapsed_ms,
+            false,
+            "stop requested; in-flight request not known to be cancelled",
+        );
+        h.transfer = TransferState::Idle;
+        return;
+    }
+    let current = match &h.transfer {
+        TransferState::Fetching {
+            capture, pending, ..
+        } => {
+            pending.correlation == envelope.pending.correlation
+                && pending.epoch == h.epoch
+                && pending.epoch == envelope.pending.epoch
+                && pending.session == h.session
+                && pending.session == envelope.pending.session
+                && pending.seal == envelope.pending.seal
+                && capture.is_sealed_by(pending.epoch, &pending.correlation)
+        }
+        _ => false,
+    };
+    if !current {
+        h.log_transfer_event(
+            &envelope.pending,
+            TrailKind::Ignored,
+            envelope.diagnostic.elapsed_ms,
+            false,
+            "reply belonged to an earlier transfer or connection",
+        );
+        return;
+    }
+    let (capture, pending) = match std::mem::replace(&mut h.transfer, TransferState::Idle) {
+        TransferState::Fetching {
+            capture, pending, ..
+        } => (capture, pending),
+        _ => unreachable!(),
+    };
+    match envelope.result {
+        Ok(TransferReply::Stopped) => {
+            h.log_transfer_event(
+                &pending,
+                TrailKind::Invalidated,
+                envelope.diagnostic.elapsed_ms,
+                false,
+                "stopped at a chunk boundary; no Save dialog",
+            );
+            h.status = "Transfer stopped. No file was saved.".into();
+        }
+        Ok(TransferReply::Original(bytes)) => {
+            h.log_transfer_event(
+                &pending,
+                TrailKind::Completed,
+                envelope.diagnostic.elapsed_ms,
+                true,
+                "",
+            );
+            // The dialog owns a locally generated identity of its own. Using
+            // `start` here would supersede an in-flight page or preview and
+            // would make the callback test against the wrong correlation.
+            let dialog = Pending {
+                correlation: h.next_correlation(),
+                session: h.session,
+                started: Instant::now(),
+                method: "local",
+            };
+            h.log_event(
+                &dialog,
+                Lane::Library,
+                TrailKind::Started,
+                0,
+                false,
+                "save dialog opened",
+            );
+            h.transfer = TransferState::Dialog {
+                capture: capture.clone(),
+                pending: pending.clone(),
+                dialog: dialog.clone(),
+                bytes,
+            };
+            h.status = "Choose where to save the original…".into();
+            let epoch = h.epoch;
+            let session = h.session;
+            let seal = capture.seal();
+            let dialog_correlation = dialog.correlation.clone();
+            tx.save_file(
+                FileDialogOptions {
+                    title: "Export Prints original".into(),
+                    file_name: Some(filename(capture.path())),
+                    ..FileDialogOptions::default()
+                },
+                move |s: &mut Studio, result, _| {
+                    let h = &mut s.hosted;
+                    if !dialog_is_current(h, epoch, session, seal, &dialog_correlation) {
+                        return;
+                    }
+                    match result {
+                        Ok(Some(path)) => {
+                            let (dialog, bytes) =
+                                match std::mem::replace(&mut h.transfer, TransferState::Idle) {
+                                    TransferState::Dialog { dialog, bytes, .. } => (dialog, bytes),
+                                    _ => return,
+                                };
+                            h.log_event(
+                                &dialog,
+                                Lane::Library,
+                                TrailKind::Completed,
+                                elapsed_ms(dialog.started),
+                                true,
+                                "destination accepted; write starting",
+                            );
+                            // One accepted destination starts exactly one local
+                            // write, still owned by the transfer lane.
+                            let write_pending = Pending {
+                                correlation: h.next_correlation(),
+                                session: h.session,
+                                started: Instant::now(),
+                                method: "local",
+                            };
+                            h.status = "Writing original…".into();
+                            match OriginalWrite::start(path, bytes.into(), s.wake.clone()) {
+                                Ok(write) => {
+                                    h.log_event(
+                                        &write_pending,
+                                        Lane::Library,
+                                        TrailKind::Started,
+                                        0,
+                                        false,
+                                        "",
+                                    );
+                                    h.transfer = TransferState::Writing {
+                                        pending: write_pending,
+                                        write,
+                                    };
+                                }
+                                Err(_) => {
+                                    h.status = "Couldn't write the selected file.".into();
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            let dialog =
+                                match std::mem::replace(&mut h.transfer, TransferState::Idle) {
+                                    TransferState::Dialog { dialog, .. } => dialog,
+                                    _ => return,
+                                };
+                            h.log_event(
+                                &dialog,
+                                Lane::Library,
+                                TrailKind::Completed,
+                                elapsed_ms(dialog.started),
+                                false,
+                                "destination declined",
+                            );
+                            h.status = "Export cancelled.".into();
+                        }
+                        Err(_) => {
+                            let dialog =
+                                match std::mem::replace(&mut h.transfer, TransferState::Idle) {
+                                    TransferState::Dialog { dialog, .. } => dialog,
+                                    _ => return,
+                                };
+                            h.log_event(
+                                &dialog,
+                                Lane::Library,
+                                TrailKind::Failed,
+                                elapsed_ms(dialog.started),
+                                false,
+                                "save dialog failed",
+                            );
+                            h.status = "Couldn't open the Save dialog.".into();
+                        }
+                    }
+                },
+            );
+        }
+        Err(failure) => {
+            h.log_transfer_event(
+                &pending,
+                TrailKind::Failed,
+                envelope.diagnostic.elapsed_ms,
+                true,
+                &failure.cause(),
+            );
+            h.last_failure = Some(failure.clone());
+            if failure.unauthorized {
+                // Shared authority is gone. Disconnect clears the library,
+                // both older lanes and every transfer capture.
+                h.disconnect();
+                if s.screen == Screen::Hosted {
+                    s.screen = Screen::Connection;
+                    tx.blur();
+                }
+            } else {
+                // Retry stays bound to the captured output, not the selection
+                // the user may have moved to while the fetch was running.
+                h.transfer = TransferState::Failed { capture };
+            }
+            h.status = format!("{} {}", failure.message, failure.recovery);
+        }
+    }
+}
+
+/// Exact ownership of the open Save dialog. The dialog has its own correlation
+/// because opening it must not supersede a page or preview reply in flight.
+fn dialog_is_current(h: &Hosted, epoch: u64, session: u64, seal: u64, correlation: &str) -> bool {
+    h.epoch == epoch
+        && h.session == session
+        && matches!(
+            &h.transfer,
+            TransferState::Dialog { capture, dialog, .. }
+                if capture.seal() == seal && dialog.correlation == correlation
+        )
 }
 
 /// Deliver one library-lane reply only when it belongs to the current
@@ -1208,102 +1776,6 @@ fn apply_library(s: &mut Studio, tx: &mut Tx, envelope: Envelope) {
             if let (Some(library), Some(cache)) = (&mut h.library, &s.cache) {
                 library.preview = Some(cache.load(Arc::<[u8]>::from(bytes)));
             }
-        }
-        (Operation::Transfer(Transfer::Original), Ok(Reply::Export(bytes, name))) => {
-            h.log_event(
-                &pending,
-                Lane::Library,
-                TrailKind::Completed,
-                envelope.diagnostic.elapsed_ms,
-                true,
-                "",
-            );
-            h.start(Operation::ChooseDestination);
-            let epoch = h.epoch;
-            tx.save_file(
-                FileDialogOptions {
-                    title: "Export Prints original".into(),
-                    file_name: Some(name),
-                    ..FileDialogOptions::default()
-                },
-                move |s: &mut Studio, result, _| {
-                    let h = &mut s.hosted;
-                    if h.epoch != epoch
-                        || !matches!(h.operation, Some(Operation::ChooseDestination))
-                    {
-                        return;
-                    }
-                    match result {
-                        Ok(Some(path)) => {
-                            // The dialog completed; a file write is a new,
-                            // separately reported operation, not a superseded
-                            // dialog.
-                            if let Some(pending) = h.primary_pending.take() {
-                                h.log_event(
-                                    &pending,
-                                    Lane::Library,
-                                    TrailKind::Completed,
-                                    elapsed_ms(pending.started),
-                                    true,
-                                    "destination accepted; write starting",
-                                );
-                            }
-                            match OriginalWrite::start(path, bytes.into(), s.wake.clone()) {
-                                Ok(write) => {
-                                    let pending = Pending {
-                                        correlation: h.next_correlation(),
-                                        session: h.session,
-                                        started: Instant::now(),
-                                        method: "local",
-                                    };
-                                    h.log_event(
-                                        &pending,
-                                        Lane::Library,
-                                        TrailKind::Started,
-                                        0,
-                                        false,
-                                        "",
-                                    );
-                                    h.primary_pending = Some(pending);
-                                    h.operation = Some(Operation::WriteOriginal(write));
-                                }
-                                Err(_) => {
-                                    h.operation = None;
-                                    h.status = "Couldn't write the selected file.".into();
-                                }
-                            }
-                        }
-                        Ok(None) => {
-                            if let Some(pending) = h.primary_pending.take() {
-                                h.log_event(
-                                    &pending,
-                                    Lane::Library,
-                                    TrailKind::Completed,
-                                    elapsed_ms(pending.started),
-                                    false,
-                                    "destination declined",
-                                );
-                            }
-                            h.operation = None;
-                            h.status = "Export cancelled.".into();
-                        }
-                        Err(_) => {
-                            if let Some(pending) = h.primary_pending.take() {
-                                h.log_event(
-                                    &pending,
-                                    Lane::Library,
-                                    TrailKind::Failed,
-                                    elapsed_ms(pending.started),
-                                    false,
-                                    "save dialog failed",
-                                );
-                            }
-                            h.operation = None;
-                            h.status = "Couldn't open the Save dialog.".into();
-                        }
-                    }
-                },
-            );
         }
         (Operation::Forget, Ok(Reply::Forgotten)) => {
             h.log_event(
@@ -1677,7 +2149,7 @@ fn asset_detail(h: &Hosted, library: &Library, item: &OutputItem, p: Ink) -> El 
         .child(label(&item.print.model, 13.0, 500.0, p.muted).wrap());
     if !h.busy() {
         let mut buttons = row().gap(7.0);
-        if item.print.bytes <= EXPORT_BYTES {
+        if item.print.bytes <= EXPORT_BYTES && !h.transfer_busy() {
             buttons = buttons.child(action("hosted-save", "Export original", p, true, |s, _| {
                 s.hosted.transfer(Transfer::Original)
             }));
@@ -1971,10 +2443,14 @@ pub(super) fn library(s: &Studio, p: Ink) -> El {
         }
     }
     detail = detail.child(catalogue).child(report_panel(h, p));
-    let mut feedback = row().gap(10.0).items_center().child(status(h, p));
-    if let Some(path) = &library.last_export {
+    let status_row = row()
+        .w_full()
+        .gap(10.0)
+        .items_center()
+        .child(status(h, p).grow(1.0).shrink().min_w(0.0));
+    let mut status_row = if let Some(path) = &library.last_export {
         let path = path.clone();
-        feedback = feedback.child(action(
+        status_row.child(action(
             "hosted-reveal",
             "Show last export",
             p,
@@ -1984,8 +2460,56 @@ pub(super) fn library(s: &Studio, p: Ink) -> El {
                     s.hosted.status = "Couldn't show that file in the desktop file manager.".into();
                 }
             },
-        ));
-    }
+        ))
+    } else {
+        status_row
+    };
+    let transfer_feedback = match &h.transfer {
+        TransferState::Fetching {
+            observed, total, ..
+        } => {
+            let progress = match total {
+                Some(total) => format!("Fetching original · {observed} of {total} bytes received"),
+                None => format!("Fetching original · {observed} bytes received · total unknown"),
+            };
+            Some(
+                row()
+                    .w_full()
+                    .gap(10.0)
+                    .items_center()
+                    .child(
+                        label(progress, 12.0, 500.0, p.muted)
+                            .wrap()
+                            .grow(1.0)
+                            .shrink()
+                            .min_w(0.0),
+                    )
+                    .child(action(
+                        "hosted-transfer-cancel",
+                        "Stop transfer",
+                        p,
+                        false,
+                        |s, _| s.hosted.cancel_transfer(),
+                    )),
+            )
+        }
+        TransferState::Failed { .. } => {
+            status_row = status_row.child(action(
+                "hosted-transfer-retry",
+                "Retry transfer",
+                p,
+                false,
+                |s, _| s.hosted.retry_transfer(),
+            ));
+            None
+        }
+        _ => None,
+    };
+    let feedback = col()
+        .w_full()
+        .gap(5.0)
+        .child(status_row)
+        .children(transfer_feedback);
     col()
         .key("hosted-view")
         .w_full()
@@ -2109,6 +2633,189 @@ mod tests {
         let report = h.report();
         assert!(!report.contains("op-0 "));
         assert!(report.contains("op-14 "));
+    }
+
+    fn hosted_with_one_item() -> Hosted {
+        let item: OutputItem = serde_json::from_value(serde_json::json!({
+            "print": {
+                "printId": "print_abc",
+                "computerId": "computer-1",
+                "kind": "image",
+                "model": "fixture",
+                "format": "png",
+                "bytes": 3,
+                "createdAt": 1730000000000u64,
+            },
+            "path": "/prints/print.png",
+        }))
+        .unwrap();
+        let client = OysterClient::new(
+            "http://127.0.0.1:9",
+            "prints",
+            ApiKey::new("oyk_local_fixture_key"),
+        )
+        .unwrap();
+        let mut h = Hosted::new(&Prefs::memory());
+        h.library = Some(Library::new(
+            Arc::new(client),
+            OutputRead {
+                page: OutputPage {
+                    items: vec![item],
+                    next: None,
+                },
+                fallback: None,
+            },
+        ));
+        h
+    }
+
+    #[test]
+    fn original_transfer_owns_its_own_lane_and_allows_one_at_a_time() {
+        let mut h = hosted_with_one_item();
+        assert!(h.library.as_ref().is_some_and(|l| l.selected().is_some()));
+        h.transfer(Transfer::Original);
+        assert!(!h.busy(), "browsing, selection and preview stay available");
+        assert!(
+            h.transfer_busy(),
+            "a second transfer must not queue a dialog"
+        );
+        assert!(matches!(
+            &h.transfer,
+            TransferState::Fetching { observed, total, .. }
+                if *observed == 0 && *total == Some(3)
+        ));
+        h.transfer(Transfer::Original);
+        assert!(matches!(&h.transfer, TransferState::Fetching { .. }));
+    }
+
+    #[test]
+    fn stopping_a_transfer_has_no_library_effect_and_a_redacted_trail() {
+        let mut h = hosted_with_one_item();
+        h.transfer(Transfer::Original);
+        h.cancel_transfer();
+        assert!(matches!(&h.transfer, TransferState::Stopping { .. }));
+        assert!(h.transfer_busy());
+        assert!(!h.busy());
+        assert!(h.library.is_some(), "the last readable page is unchanged");
+        let report = h.report();
+        assert!(report.contains("transfer openOutput"));
+        assert!(report.contains("in-flight request not known to be cancelled"));
+        assert!(!report.contains("/prints/print.png"));
+        assert!(!report.contains("oyk_local_fixture_key"));
+    }
+
+    #[test]
+    fn retry_rebinds_capture_to_current_generation_and_new_correlation() {
+        let mut h = hosted_with_one_item();
+        let other: OutputItem = serde_json::from_value(serde_json::json!({
+            "print": {
+                "printId": "print_other",
+                "computerId": "computer-1",
+                "kind": "image",
+                "model": "fixture",
+                "format": "png",
+                "bytes": 7,
+                "createdAt": 1730000000001u64,
+            },
+            "path": "/prints/other.png",
+        }))
+        .unwrap();
+        let library = h.library.as_mut().unwrap();
+        library.page.items.push(other);
+        library.selected = Some(1);
+
+        // The failed attempt was sealed to an older correlation.
+        let original = library.page.items[0].clone();
+        let old_capture = TransferCapture::new(&original, h.epoch, "op-old");
+        let old_seal = old_capture.seal();
+        h.transfer = TransferState::Failed {
+            capture: old_capture,
+        };
+
+        h.retry_transfer();
+
+        match &h.transfer {
+            TransferState::Fetching {
+                capture, pending, ..
+            } => {
+                assert_ne!(pending.correlation, "op-old");
+                assert_eq!(pending.seal, capture.seal());
+                assert!(capture.is_sealed_by(pending.epoch, &pending.correlation));
+                assert_ne!(
+                    capture.seal(),
+                    old_seal,
+                    "retry must re-seal for its own request"
+                );
+                assert_eq!(capture.path(), "/prints/print.png");
+                assert_eq!(capture.item().print.print_id, "print_abc");
+            }
+            _ => panic!("retry did not start a new fetch"),
+        }
+    }
+
+    #[test]
+    fn save_dialog_owns_its_correlation_without_superseding_library_work() {
+        let mut h = hosted_with_one_item();
+        let page_pending = Pending {
+            correlation: "op-page".into(),
+            session: h.session,
+            started: Instant::now(),
+            method: "listOutputs",
+        };
+        h.primary_pending = Some(page_pending);
+        h.operation = Some(Operation::Transfer(Transfer::Preview));
+        h.transfer(Transfer::Original);
+        let (capture, pending) = match &h.transfer {
+            TransferState::Fetching {
+                capture, pending, ..
+            } => (capture.clone(), pending.clone()),
+            _ => panic!("fetch did not start"),
+        };
+        let envelope = TransferEnvelope {
+            pending: pending.clone(),
+            diagnostic: Diagnostic::success("fetch original", "openOutput", 1, None),
+            result: Ok(TransferReply::Original(b"abc".to_vec())),
+        };
+        let mut s = Studio::new();
+        s.screen = Screen::Hosted;
+        s.hosted = h;
+        let mut tx = Tx::default();
+        apply_transfer(&mut s, &mut tx, envelope);
+
+        // Opening the export dialog must not invalidate an in-flight reply.
+        assert!(
+            s.hosted
+                .primary_pending
+                .as_ref()
+                .is_some_and(|pending| pending.correlation == "op-page")
+        );
+        assert!(matches!(
+            s.hosted.operation,
+            Some(Operation::Transfer(Transfer::Preview))
+        ));
+        let dialog = match &s.hosted.transfer {
+            TransferState::Dialog { dialog, .. } => dialog.clone(),
+            _ => panic!("expected a dialog owned by the transfer lane"),
+        };
+        assert_ne!(
+            dialog.correlation, pending.correlation,
+            "the dialog needs its own correlation"
+        );
+        let (epoch, session, seal) = (s.hosted.epoch, s.hosted.session, capture.seal());
+        assert!(dialog_is_current(
+            &s.hosted,
+            epoch,
+            session,
+            seal,
+            &dialog.correlation
+        ));
+        assert!(!dialog_is_current(
+            &s.hosted,
+            epoch,
+            session,
+            seal,
+            &pending.correlation
+        ));
     }
 
     #[test]
