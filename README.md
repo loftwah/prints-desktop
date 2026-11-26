@@ -29,7 +29,7 @@
 | --- | --- |
 | **See what the UI does** | Open the [creative archive in your browser](https://prints.loftwah.com/#archive). Follow the [native walkthrough](https://prints.loftwah.com/#walkthrough) to compare **Higher Than Before** and export an original. |
 | **Work offline** | Download the preview and drop up to 300 JPEG, PNG or WebP originals into the workspace. Choose **Set first image**, select another original and choose **Compare images**. The offline library needs no account, wallet, token, or model credits. |
-| **Resume a draft** | Choose **Keep with draft** in each image’s details. Open **Prompt draft** to save your brief and return to the shortlisted originals after reopening Prints. |
+| **Resume a draft** | Choose **Keep with draft** in each image’s details. Open **Prompt draft** and write your brief. Prints saves it with the shortlist as you work. |
 | **Browse an Oyster library in the app** | Open **Connect Prints** and use a scoped App key for your installation. [Desktop connection steps](docs/oyster.md) |
 | **Use Shiitake** | Open Shiitake in your project folder and give it the release art brief below. For your first tool call, use your own authorised Fungi Team or Oyster connection. [Shiitake terminal guide](https://docs.fungi.computer/guides/use-the-terminal) |
 | **Build with AI** | Start with one brief and one target size. Create through web Prints, then inspect the resulting file in the desktop app. [Open Prints and choose a prompt](https://prints.loftwah.com/) |
@@ -56,6 +56,11 @@ Keep this read-only. Ask me to select an output before exporting anything.
 ```
 
 The desktop app reads compatible Oyster libraries and hands creation off to signed-in web Prints. Hosted generation requires model access and funding. [Connection and permission details](docs/oyster.md) · [Native creation status](https://github.com/loftwah/prints-desktop/issues/6)
+
+Prints saves a working draft after a short pause in editing and flushes pending
+changes on normal close. After a crash or forced quit, the last completed save
+is available. The editor shows when a save fails so you can retry. **Undo clear**
+recovers the most recent cleared brief, including after reopening.
 
 ## Get the preview
 
