@@ -36,7 +36,7 @@ pub fn read(saved: Option<Vec<Reference>>) -> Vec<Reference> {
 
 // Keep the existing UTF-8 representation and preserve other legal paths
 // through serde's native OsStr encoding on the same operating system.
-mod native_path {
+pub(crate) mod native_path {
     use std::ffi::OsString;
 
     use super::*;
@@ -48,7 +48,7 @@ mod native_path {
         Native(OsString),
     }
 
-    pub(super) fn serialize<S: serde::Serializer>(
+    pub(crate) fn serialize<S: serde::Serializer>(
         path: &Path,
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
@@ -58,7 +58,7 @@ mod native_path {
         }
     }
 
-    pub(super) fn deserialize<'de, D: serde::Deserializer<'de>>(
+    pub(crate) fn deserialize<'de, D: serde::Deserializer<'de>>(
         deserializer: D,
     ) -> Result<PathBuf, D::Error> {
         match Stored::deserialize(deserializer)? {

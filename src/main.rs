@@ -257,7 +257,7 @@ struct Studio {
     theme_light: bool,
     inspector: bool,
     draft: TextEdit,
-    draft_dirty: bool,
+    working: draft::Store,
     draft_shortlist: Vec<usize>,
     search: Search,
     status: String,
@@ -303,7 +303,12 @@ impl Studio {
                 }),
         );
         let theme_light = prefs.get("light").unwrap_or(false);
-        let draft = TextEdit::new(prefs.get::<String>("draft").unwrap_or_default());
+        let working = draft::Store::open(&prefs);
+        let text = working.loaded.as_ref().map_or_else(
+            || prefs.get::<String>("draft").unwrap_or_default(),
+            |saved| saved.text.clone(),
+        );
+        let draft = TextEdit::new(text);
         let hosted = hosted::Hosted::new(&prefs);
         Self {
             shelf: Shelf::Archive,
@@ -315,7 +320,7 @@ impl Studio {
             theme_light,
             inspector: true,
             draft,
-            draft_dirty: false,
+            working,
             draft_shortlist: Vec::new(),
             search: Search::default(),
             status: String::new(),
@@ -369,14 +374,23 @@ impl Studio {
             return;
         }
         self.local_loaded = true;
-        for record in local::read(self.prefs.get(local::LIBRARY_KEY)) {
+        let saved = self.working.loaded.take();
+        let (records, shortlist) = if let Some(saved) = saved {
+            (Some(saved.library), Some(saved.shortlist))
+        } else {
+            (self.prefs.get(local::LIBRARY_KEY), None)
+        };
+        for record in local::read(records) {
             if record.favourite {
                 self.favourites.push(self.assets.len());
             }
-            if record.in_draft {
+            if shortlist.is_none() && record.in_draft {
                 self.draft_shortlist.push(self.assets.len());
             }
             self.assets.push(Print::linked(record.path, None));
+        }
+        if let Some(entries) = shortlist {
+            self.draft_shortlist = draft::resolve(&self.assets, &entries);
         }
     }
 
@@ -442,19 +456,7 @@ impl Studio {
     }
 
     fn persist_local(&mut self) -> bool {
-        let originals: Vec<_> = self
-            .assets
-            .iter()
-            .enumerate()
-            .filter_map(|(index, asset)| {
-                Some(local::Reference {
-                    path: asset.path()?.to_path_buf(),
-                    favourite: self.favourites.contains(&index),
-                    in_draft: self.draft_shortlist.contains(&index),
-                })
-            })
-            .collect();
-        if self.prefs.set(local::LIBRARY_KEY, &originals).is_err() {
+        if !draft::persist(self) {
             self.status =
                 "The local library could not be saved. Changes apply for this session.".into();
             return false;
@@ -773,14 +775,14 @@ impl Studio {
         }
     }
 
-    fn use_prompt(&mut self) {
+    fn use_prompt(&mut self, tx: &mut Tx) {
         let Some(index) = self.selected else { return };
         let Some(study) = self.assets.get(index).and_then(Print::study) else {
             return;
         };
         if self.draft.text.trim().is_empty() {
             self.draft = TextEdit::new(study.prompt);
-            self.draft_dirty = true;
+            self.working.pending(tx);
             self.status.clear();
             if !self.draft_shortlist.contains(&index) {
                 draft::toggle(self, index);
@@ -793,16 +795,7 @@ impl Studio {
     }
 
     fn save_draft(&mut self) {
-        if !self.draft_dirty {
-            return;
-        }
-        match self.prefs.set("draft", &self.draft.text) {
-            Ok(()) => {
-                self.draft_dirty = false;
-                self.status = "Draft saved on this device.".into();
-            }
-            Err(_) => self.status = "The draft could not be saved to disk.".into(),
-        }
+        draft::persist(self);
     }
 }
 
@@ -1168,11 +1161,15 @@ fn poll(s: &mut Studio, time: f64, tx: &mut Tx) -> bool {
     let hosted_updated = hosted::poll(s, time, tx);
     let imported = s.finish_import(tx);
     let images_updated = s.poll_local_images();
+    let draft_updated = s.working.due(time);
+    if draft_updated {
+        s.save_draft();
+    }
     let LocalExport::WriteOriginal(write) = &s.local_export else {
-        return hosted_updated || imported || images_updated;
+        return hosted_updated || imported || images_updated || draft_updated;
     };
     let Some(result) = write.take() else {
-        return hosted_updated || imported || images_updated;
+        return hosted_updated || imported || images_updated || draft_updated;
     };
     s.local_export = LocalExport::Idle;
     s.status = match result {
@@ -1193,6 +1190,9 @@ fn export_action(s: &Studio, key: &'static str, p: Ink) -> El {
 }
 
 fn finish_writes(s: &mut Studio, _: &mut Tx) {
+    if s.working.needs_save() {
+        s.save_draft();
+    }
     s.local_export = LocalExport::Idle;
     s.hosted.finish_write();
 }
@@ -1400,8 +1400,8 @@ fn inspector(s: &Studio, asset: &Print, p: Ink) -> El {
             .child(label("Creative brief", 13.0, 650.0, p.primary))
             .child(label(study.prompt, 13.0, 450.0, p.muted).wrap())
             .child(
-                action("use-prompt", "Use in draft", p, false, |s, _| {
-                    s.use_prompt()
+                action("use-prompt", "Use in draft", p, false, |s, tx| {
+                    s.use_prompt(tx)
                 })
                 .w_full(),
             );
@@ -1853,7 +1853,7 @@ fn drafting(s: &Studio, p: Ink) -> El {
                 .wrap()
                 .placeholder("Describe the image you want to make…", p.muted)
                 .on_edit(|s: &mut Studio| &mut s.draft)
-                .on_input_change(|s: &mut Studio, _| s.draft_dirty = true),
+                .on_input_change(|s: &mut Studio, tx| s.working.pending(tx)),
         )
         .child(
             row()
@@ -1868,13 +1868,11 @@ fn drafting(s: &Studio, p: Ink) -> El {
                         s.status = "Draft copied.".into();
                     }
                 }))
-                .child(action("clear-draft", "Clear draft", p, false, |s, _| {
-                    s.draft = TextEdit::new("");
-                    s.draft_dirty = true;
-                    s.status.clear();
-                }))
+                .child(action("clear-draft", "Clear draft", p, false, draft::clear))
+                .children(draft::restore_control(s, p))
                 .child(label(&s.status, 12.0, 500.0, p.muted).wrap()),
         )
+        .child(label(s.working.status(), 12.0, 500.0, p.muted).wrap())
         .child(draft::shortlist(s, p))
 }
 
